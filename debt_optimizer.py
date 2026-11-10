@@ -40,6 +40,12 @@ def advance_month(d: datetime.date, target_day: int, months: int = 1) -> datetim
     return make_date(new_year, new_month, target_day)
 
 
+def get_first_due_date(start_date: datetime.date, due_day: int) -> datetime.date:
+    """Finds the first upcoming due date on or after start_date."""
+    d = make_date(start_date.year, start_date.month, due_day)
+    return advance_month(d, due_day) if d < start_date else d
+
+
 # =====================================================================
 # DATA STRUCTURES (Optimized with slots for memory & performance)
 # =====================================================================
@@ -65,6 +71,7 @@ class CreditCard:
     
     # Internal dynamic simulation state
     next_due: datetime.date = field(default_factory=lambda: datetime.date(2000, 1, 1))
+    cycle_due_date: datetime.date = field(default_factory=lambda: datetime.date(2000, 1, 1))
     next_cycle_end: datetime.date = field(default_factory=lambda: datetime.date(2000, 1, 1))
     adb_reg_acc: float = 0.0
     adb_promo_acc: float = 0.0
@@ -72,6 +79,7 @@ class CreditCard:
     amount_paid_this_cycle: float = 0.0
     remaining_min_due: float = 0.0
     cycle_fees: float = 0.0
+    consecutive_full_payments: int = 0  # Tracks months with full statement balance paid; grace restores at 2
 
 
 @dataclass(slots=True)
@@ -136,9 +144,7 @@ class DebtOptimizer:
         self.monthly: List[MonthlyPayment] = []
         for m in self.raw_monthly:
             due_day = int(m['Due Day'])
-            next_due = make_date(self.start_date.year, self.start_date.month, due_day)
-            if next_due < self.start_date:
-                next_due = advance_month(next_due, due_day)
+            next_due = get_first_due_date(self.start_date, due_day)
             self.monthly.append(MonthlyPayment(
                 name=m['Name'],
                 amount=float(m['Amount']),
@@ -150,9 +156,7 @@ class DebtOptimizer:
         self.loans: List[Loan] = []
         for l in self.raw_loans:
             due_day = int(l['Due Day'])
-            next_due = make_date(self.start_date.year, self.start_date.month, due_day)
-            if next_due < self.start_date:
-                next_due = advance_month(next_due, due_day)
+            next_due = get_first_due_date(self.start_date, due_day)
             amt_left = float(l['Amount Left'])
             min_pay = float(l['Minimum Payment'])
             self.loans.append(Loan(
@@ -197,30 +201,42 @@ class DebtOptimizer:
             )
             
             # 1. Determine next upcoming due date >= start_date
-            next_due = make_date(self.start_date.year, self.start_date.month, due_day)
-            if next_due < self.start_date:
-                next_due = advance_month(next_due, due_day)
+            next_due = get_first_due_date(self.start_date, due_day)
             cc_obj.next_due = next_due
             
             # 2. Cycle end date for statement currently due
-            prev_cycle_end = self.calculate_cycle_end_date(
+            due_cycle_end = self.calculate_cycle_end_date(
                 cc_obj.issuer, next_due, cc_obj.grace_period_days,
                 cc_obj.cycle_end_nth_weekday, cc_obj.statement_cycle_end_day
             )
             
-            # 3. Next cycle end date for the subsequent statement
-            following_due = advance_month(next_due, due_day)
-            next_cycle_end = self.calculate_cycle_end_date(
-                cc_obj.issuer, following_due, cc_obj.grace_period_days,
-                cc_obj.cycle_end_nth_weekday, cc_obj.statement_cycle_end_day
-            )
-            while next_cycle_end < self.start_date:
-                following_due = advance_month(following_due, due_day)
+            # 3. Determine next cycle end date & previous cycle end date for ADB initialization
+            if due_cycle_end >= self.start_date:
+                # The cycle for next_due has not closed yet; it closes on due_cycle_end
+                cc_obj.cycle_due_date = next_due
+                cc_obj.next_cycle_end = due_cycle_end
+                prior_due = advance_month(next_due, due_day, -1)
+                prev_cycle_end = self.calculate_cycle_end_date(
+                    cc_obj.issuer, prior_due, cc_obj.grace_period_days,
+                    cc_obj.cycle_end_nth_weekday, cc_obj.statement_cycle_end_day
+                )
+            else:
+                # The cycle for next_due already closed before start_date
+                following_due = advance_month(next_due, due_day)
                 next_cycle_end = self.calculate_cycle_end_date(
                     cc_obj.issuer, following_due, cc_obj.grace_period_days,
                     cc_obj.cycle_end_nth_weekday, cc_obj.statement_cycle_end_day
                 )
-            cc_obj.next_cycle_end = next_cycle_end
+                while next_cycle_end < self.start_date:
+                    due_cycle_end = next_cycle_end
+                    following_due = advance_month(following_due, due_day)
+                    next_cycle_end = self.calculate_cycle_end_date(
+                        cc_obj.issuer, following_due, cc_obj.grace_period_days,
+                        cc_obj.cycle_end_nth_weekday, cc_obj.statement_cycle_end_day
+                    )
+                cc_obj.cycle_due_date = following_due
+                cc_obj.next_cycle_end = next_cycle_end
+                prev_cycle_end = due_cycle_end
             
             # 4. Spec 1a: Initialize ADB for mid-cycle start
             if prev_cycle_end < self.start_date:
@@ -239,10 +255,9 @@ class DebtOptimizer:
     def get_next_payday(self) -> datetime.date:
         """Finds the next payday strictly after current_date in O(1) time."""
         if self.current_date < self.income.start_date:
-            return min(self.income.start_date, self.end_date)
+            return self.income.start_date
         cycles = (self.current_date - self.income.start_date).days // 14
-        next_d = self.income.start_date + timedelta(days=(cycles + 1) * 14)
-        return min(next_d, self.end_date)
+        return self.income.start_date + timedelta(days=(cycles + 1) * 14)
 
     def is_payday(self, d: datetime.date) -> bool:
         """Determines if date d is a payday in O(1) time."""
@@ -344,9 +359,12 @@ class DebtOptimizer:
             # 3. Daily Accruals & Promo Expirations
             # -------------------------------------------------------------
             for loan in self.loans:
-                if loan.amount_left > 0:
+                if loan.amount_left > 0.005:
                     daily_interest = loan.amount_left * (loan.apr / 365.0)
                     loan.amount_left += daily_interest
+                else:
+                    loan.amount_left = 0.0
+                    loan.remaining_min_due = 0.0
                     
             for cc in self.ccs:
                 # Promo expiration
@@ -355,6 +373,11 @@ class DebtOptimizer:
                     cc.promo_balance = 0.0
                     cc.promo_end_date = None
                     
+                if cc.balance < 0.005:
+                    cc.balance = 0.0
+                if cc.promo_balance < 0.005:
+                    cc.promo_balance = 0.0
+
                 cc.adb_reg_acc += cc.balance
                 cc.adb_promo_acc += cc.promo_balance
                 cc.days_in_cycle += 1
@@ -374,16 +397,18 @@ class DebtOptimizer:
                         if d == m.next_due:
                             mandatory_total += m.amount
                     for loan in self.loans:
-                        if loan.amount_left > 0 and d == loan.next_due:
+                        if loan.amount_left > 0.005 and d == loan.next_due:
                             mandatory_total += min(loan.amount_left, loan.remaining_min_due)
                     for cc in self.ccs:
                         if d == cc.next_due:
-                            if cc.grace_active:
-                                # Rule 4: Reserve statement balance to keep grace active
-                                needed = max(cc.remaining_min_due, cc.statement_balance - cc.amount_paid_this_cycle)
-                                mandatory_total += needed
-                            else:
-                                mandatory_total += cc.remaining_min_due
+                            total_owed = round(cc.balance + cc.promo_balance, 2)
+                            if total_owed > 0.005:
+                                if cc.grace_active:
+                                    # Rule 4: Reserve statement balance to keep grace active
+                                    needed = max(cc.remaining_min_due, cc.statement_balance - cc.amount_paid_this_cycle)
+                                    mandatory_total += min(needed, total_owed)
+                                else:
+                                    mandatory_total += min(cc.remaining_min_due, total_owed)
                     d += timedelta(days=1)
                     
                 disposable = self.checking - self.buffer - mandatory_total
@@ -408,6 +433,8 @@ class DebtOptimizer:
                     if target_type == 'cc':
                         pay_amt = min(disposable, target.balance)
                         target.balance -= pay_amt
+                        if target.balance < 0.005:
+                            target.balance = 0.0
                         # Rule 9: Early payment updates remaining minimum
                         target.remaining_min_due = max(0.0, target.remaining_min_due - pay_amt)
                         target.amount_paid_this_cycle += pay_amt
@@ -416,6 +443,9 @@ class DebtOptimizer:
                     else:
                         pay_amt = min(disposable, target.amount_left)
                         target.amount_left -= pay_amt
+                        if target.amount_left < 0.005:
+                            target.amount_left = 0.0
+                            target.remaining_min_due = 0.0
                         # Rule 9: Early payment updates remaining minimum
                         target.remaining_min_due = max(0.0, target.remaining_min_due - pay_amt)
                         target.amount_paid_this_cycle += pay_amt
@@ -433,12 +463,15 @@ class DebtOptimizer:
                     
             # Loan Payments
             for loan in self.loans:
-                if loan.amount_left > 0 and self.current_date == loan.next_due:
+                if loan.amount_left > 0.005 and self.current_date == loan.next_due:
                     # Due is remaining minimum or remaining balance (Rule 10)
                     due_amt = min(loan.amount_left, loan.remaining_min_due)
                     pay_amt = min(due_amt, self.checking)  # Cap at checking if deficit
                     if pay_amt > 0:
                         loan.amount_left -= pay_amt
+                        if loan.amount_left < 0.005:
+                            loan.amount_left = 0.0
+                            loan.remaining_min_due = 0.0
                         self.log_transaction(f"Loan Payment: {loan.name}", -pay_amt)
                     loan.remaining_min_due = min(loan.amount_left, loan.minimum_payment)
                     loan.amount_paid_this_cycle = 0.0
@@ -447,6 +480,23 @@ class DebtOptimizer:
             # Credit Card Payments Due Today
             for cc in self.ccs:
                 if self.current_date == cc.next_due:
+                    total_owed = round(cc.balance + cc.promo_balance, 2)
+                    if total_owed <= 0.005:
+                        cc.balance = 0.0
+                        cc.promo_balance = 0.0
+                        cc.remaining_min_due = 0.0
+                        # Fix H: Even if the balance was zeroed by earlier extra payments,
+                        # a full payment was effectively made — update the consecutive streak.
+                        if not cc.grace_active:
+                            if cc.statement_balance > 0.01:
+                                cc.consecutive_full_payments += 1
+                            if cc.consecutive_full_payments >= 2:
+                                cc.grace_active = True
+                                cc.consecutive_full_payments = 0
+                        cc.amount_paid_this_cycle = 0.0
+                        cc.next_due = advance_month(cc.next_due, cc.due_day)
+                        continue
+
                     # Calculate target payment
                     if cc.grace_active:
                         target_pay = max(cc.remaining_min_due, cc.statement_balance - cc.amount_paid_this_cycle)
@@ -458,6 +508,9 @@ class DebtOptimizer:
                     else:
                         pay_amt = min(cc.remaining_min_due, self.checking)
                         
+                    # Fix F: Cap payment at total remaining card balance
+                    pay_amt = min(pay_amt, total_owed)
+
                     if pay_amt > 0:
                         # Rule 7: Minimum payment goes to lowest APR first (Promo)
                         # Any extra portion above minimum goes to highest APR first
@@ -474,6 +527,12 @@ class DebtOptimizer:
                         rem_extra = extra_portion - reg_extra_pay
                         cc.promo_balance = max(0.0, cc.promo_balance - rem_extra)
                         
+                        # Fix J: Clamp sub-cent residuals
+                        if cc.balance < 0.005:
+                            cc.balance = 0.0
+                        if cc.promo_balance < 0.005:
+                            cc.promo_balance = 0.0
+
                         cc.amount_paid_this_cycle += pay_amt
                         cc.remaining_min_due = max(0.0, cc.remaining_min_due - min_portion)
                         self.log_transaction(f"Payment to {cc.card}", -pay_amt)
@@ -482,13 +541,22 @@ class DebtOptimizer:
                     if cc.grace_active:
                         if cc.amount_paid_this_cycle < cc.statement_balance - 0.01:
                             cc.grace_active = False
+                            cc.consecutive_full_payments = 0
                             # Retroactive interest applied to CC balance (NOT checking account)
                             penalty = cc.statement_balance * (cc.apr / 365.0) * 30.0
                             cc.balance += penalty
                     else:
-                        # Restore grace if paid in full
-                        if cc.amount_paid_this_cycle >= cc.statement_balance - 0.01 and cc.statement_balance > 0:
+                        # Fix H: Grace restores only after 2 consecutive months of full statement payment.
+                        # Interest accrues on lingering charges and new purchases between cycles, so a
+                        # single full payment does not clear all interest-bearing balances; two in a row does.
+                        paid_in_full = cc.statement_balance > 0.01 and cc.amount_paid_this_cycle >= cc.statement_balance - 0.01
+                        if paid_in_full:
+                            cc.consecutive_full_payments += 1
+                        else:
+                            cc.consecutive_full_payments = 0
+                        if cc.consecutive_full_payments >= 2:
                             cc.grace_active = True
+                            cc.consecutive_full_payments = 0
                             
                     # Advance next due date
                     cc.next_due = advance_month(cc.next_due, cc.due_day)
@@ -517,11 +585,12 @@ class DebtOptimizer:
                     cc.adb_reg_acc = 0.0
                     cc.adb_promo_acc = 0.0
                     cc.days_in_cycle = 0
+                    cc.amount_paid_this_cycle = 0.0  # Fix G: Reset for the new statement cycle
                     
-                    # Advance next_cycle_end for the statement following current next_due
-                    future_due = advance_month(cc.next_due, cc.due_day)
+                    # Advance cycle_due_date and calculate next_cycle_end independently
+                    cc.cycle_due_date = advance_month(cc.cycle_due_date, cc.due_day)
                     cc.next_cycle_end = self.calculate_cycle_end_date(
-                        cc.issuer, future_due, cc.grace_period_days,
+                        cc.issuer, cc.cycle_due_date, cc.grace_period_days,
                         cc.cycle_end_nth_weekday, cc.statement_cycle_end_day
                     )
 
@@ -536,7 +605,7 @@ class DebtOptimizer:
 
 def run_self_tests():
     print("======================================================================")
-    print("Running Full Suite of Mathematical Tests (7 Original + 14 New Scenarios)")
+    print("Running Full Suite of Mathematical Tests (7 Original + 24 Extended Scenarios)")
     print("======================================================================")
 
     base_income = {'Start Date': datetime.date(2026, 1, 1), 'Paycheck 2': 2200, 'Paychecks 1 and 3': 2000}
@@ -785,8 +854,203 @@ def run_self_tests():
     assert cc23.balance < 1000.0
     print("  -> Passed!")
 
+    # Test 24: Statement Cycle Closing Between Start Date and First Due Date (Fix A)
+    print("Test 24: Cycle Closing Between Start Date and Due Date (Fix A)...")
+    opt24 = DebtOptimizer(
+        {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 1, 5), 'Initial Checking Balance': 1000, 'Checking Buffer': 0},
+        [{'Card': 'AmexEarlyCycle', 'Issuer': 'American Express', 'APR': 0.24, 'Balance': 2000, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 28, 'Statement Balance': 2000, 'Min Floor': 40, 'Grace Period Days': 25}],
+        [], [], base_income
+    )
+    # Due on Jan 28, grace 25 -> cycle closes Jan 3.
+    # Prior due was Dec 28 -> prior cycle closed Dec 3.
+    # On Jan 1, elapsed days in cycle = (2026-01-01 - 2025-12-03) = 29 days.
+    assert opt24.ccs[0].next_cycle_end == datetime.date(2026, 1, 3)
+    assert opt24.ccs[0].days_in_cycle == 29
+    assert opt24.ccs[0].adb_reg_acc == 2000.0 * 29
+    opt24.run()
+    # After Jan 3 closes, next_cycle_end should advance to Feb 3 (for Feb 28 due date)
+    assert opt24.ccs[0].next_cycle_end == datetime.date(2026, 2, 3)
+    assert opt24.ccs[0].next_due == datetime.date(2026, 1, 28)
+    print("  -> Passed!")
+
+    # Test 25: Decoupled Statement Cycle and Due Date Advancement (Fix B)
+    print("Test 25: Decoupled Statement Cycle & Due Date Advancement (Fix B)...")
+    opt25 = DebtOptimizer(
+        {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 2, 10), 'Initial Checking Balance': 2000, 'Checking Buffer': 100},
+        [{'Card': 'ChaseCard', 'Issuer': 'Chase', 'APR': 0.20, 'Balance': 1500, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 20, 'Statement Balance': 1500, 'Min Floor': 40, 'Statement Cycle End Day': 25}],
+        [], [], base_income
+    )
+    # Next due is Jan 20. Next cycle end is Jan 25.
+    assert opt25.ccs[0].next_due == datetime.date(2026, 1, 20)
+    assert opt25.ccs[0].next_cycle_end == datetime.date(2026, 1, 25)
+    opt25.run()
+    # At end of Jan and early Feb (Feb 10):
+    # Due date should have advanced to Feb 20.
+    # Cycle end should have advanced to Feb 25 independently.
+    assert opt25.ccs[0].next_due == datetime.date(2026, 2, 20)
+    assert opt25.ccs[0].next_cycle_end == datetime.date(2026, 2, 25)
+    print("  -> Passed!")
+
+    # Test 26: Lookahead Window Covers Mandatory Obligations Due on End Date (Fix E)
+    print("Test 26: Lookahead Covering End Date Mandatory Payment (Fix E)...")
+    opt26 = DebtOptimizer(
+        {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 1, 10), 'Initial Checking Balance': 1000, 'Checking Buffer': 200},
+        [{'Card': 'HighAPR', 'Issuer': 'Discover', 'APR': 0.25, 'Balance': 2000, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 25, 'Statement Balance': 2000, 'Min Floor': 40, 'Grace Period Days': 25}],
+        [], [{'Name': 'Rent', 'Amount': 300, 'Due Day': 10}],
+        {'Start Date': datetime.date(2026, 1, 15), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+    )
+    log26 = opt26.run()
+    # Lookahead on Jan 1 must reserve 300 for Rent on Jan 10, leaving 1000 - 200 - 300 = 500 for extra payment
+    extra26 = [t for t in log26 if 'Extra payment to HighAPR' in t['Description']]
+    assert len(extra26) == 1 and abs(extra26[0]['Amount']) == 500.0
+    # On Jan 10, Rent is successfully paid and checking ends at exactly buffer (200.0)
+    rent26 = [t for t in log26 if 'Monthly Payment: Rent' in t['Description']]
+    assert len(rent26) == 1 and abs(rent26[0]['Amount']) == 300.0
+    assert opt26.checking == 200.0
+    print("  -> Passed!")
+
+    # Test 27: Credit Card Payment Capped at Total Owed When Below Min Floor (Fix F)
+    print("Test 27: CC Payment Capped at Total Balance Below Min Floor (Fix F)...")
+    opt27 = DebtOptimizer(
+        {'Start Date': datetime.date(2026, 1, 10), 'End Date': datetime.date(2026, 1, 16), 'Initial Checking Balance': 500, 'Checking Buffer': 500},
+        [{'Card': 'SmallBalCard', 'Issuer': 'Chase', 'APR': 0.20, 'Balance': 15.0, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 15, 'Statement Balance': 500, 'Min Floor': 40, 'Statement Cycle End Day': 25}],
+        [], [], {'Start Date': datetime.date(2026, 1, 25), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+    )
+    log27 = opt27.run()
+    pay27 = [t for t in log27 if 'Payment to SmallBalCard' in t['Description']]
+    assert len(pay27) == 1 and abs(pay27[0]['Amount']) == 15.0  # Capped at 15.0, not 40.0
+    assert opt27.checking == 485.0
+    assert opt27.ccs[0].balance == 0.0
+    print("  -> Passed!")
+
+    # Test 28: Amount Paid This Cycle Reset on Cycle End (Fix G)
+    print("Test 28: Amount Paid This Cycle Reset on Cycle Close (Fix G)...")
+    opt28 = DebtOptimizer(
+        {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 1, 20), 'Initial Checking Balance': 1000, 'Checking Buffer': 0},
+        [{'Card': 'AmexReset', 'Issuer': 'American Express', 'APR': 0.24, 'Balance': 1000, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 25, 'Statement Balance': 1000, 'Min Floor': 40, 'Grace Period Days': 20}],
+        [], [], {'Start Date': datetime.date(2026, 1, 25), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+    )
+    # Due on Jan 25, grace 20 -> cycle closes Jan 5.
+    opt28.run()
+    # Cycle closed on Jan 5, so amount_paid_this_cycle must be reset to 0.0
+    assert opt28.ccs[0].amount_paid_this_cycle == 0.0
+    print("  -> Passed!")
+
+    # Test 29: Grace Period Requires 2 Consecutive Full Payments to Restore (Fix H)
+    print("Test 29: Grace Period Requires 2 Consecutive Full Payments to Restore (Fix H)...")
+    # Card with lost grace. Statement balance = 25 (< min floor so min == full statement).
+    # Buffer high enough to block extra payments except the first one that zeroes the balance.
+    # Jan 20 due date: total_owed=0 (zeroed by Jan 1 extra payment) -> streak = 1. Grace NOT restored yet.
+    # Jan 26 cycle closes -> new statement set. Feb 20 due date: total_owed=0 again -> streak = 2. Grace RESTORED.
+    opt29 = DebtOptimizer(
+        {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 3, 5), 'Initial Checking Balance': 1000, 'Checking Buffer': 950},
+        [{'Card': 'GraceRestoreCard', 'Issuer': 'American Express', 'APR': 0.20, 'Balance': 25, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 20, 'Statement Balance': 25, 'Min Floor': 25, 'Grace Period Days': 25}],
+        [], [], {'Start Date': datetime.date(2026, 1, 25), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+    )
+    opt29.run()
+    assert opt29.ccs[0].grace_active is True
+    assert opt29.ccs[0].consecutive_full_payments == 0  # Reset after restoration
+    print("  -> Passed!")
+
+    # Test 29b: Consecutive Streak Resets on Missed Full Payment (Fix H)
+    print("Test 29b: Consecutive Streak Resets if Full Payment Missed...")
+    # Only 300 in checking, statement_balance=500, min=25. Jan due: pays only 25 (minimum). Streak stays 0.
+    # Even after multiple months, grace should NOT restore because Jan was only a partial payment.
+    opt29b = DebtOptimizer(
+        {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 3, 5), 'Initial Checking Balance': 300, 'Checking Buffer': 275},
+        [{'Card': 'StreakCard', 'Issuer': 'American Express', 'APR': 0.20, 'Balance': 500, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 20, 'Statement Balance': 500, 'Min Floor': 25, 'Grace Period Days': 25}],
+        [], [], {'Start Date': datetime.date(2026, 2, 15), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+    )
+    opt29b.run()
+    assert opt29b.ccs[0].grace_active is False
+    assert opt29b.ccs[0].consecutive_full_payments == 0
+    print("  -> Passed!")
+
+    # Test 30: Sub-Cent Floating Point Residual Clamping (Fix J)
+    print("Test 30: Sub-Cent Balance Residual Clamping (Fix J)...")
+    opt30 = DebtOptimizer(
+        {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 1, 3), 'Initial Checking Balance': 100, 'Checking Buffer': 0},
+        [], [{'Name': 'MicroLoan', 'Amount Left': 0.0001, 'APR': 0.05, 'Minimum Payment': 50, 'Due Day': 15}], [],
+        {'Start Date': datetime.date(2026, 1, 25), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+    )
+    opt30.run()
+    assert opt30.loans[0].amount_left == 0.0
+    assert opt30.loans[0].remaining_min_due == 0.0
+    print("  -> Passed!")
+
+    # Test 31: Output Ledger Sorting by Date Ascending & Amount Descending
+    print("Test 31: Output Ledger Sorting & Running Balance Consistency...")
+    sample_schedule = [
+        {'Date': '2026-01-01', 'Description': 'Rent', 'Amount': -1500.0, 'Checking Balance': 1500.0},
+        {'Date': '2026-01-01', 'Description': 'Paycheck Received', 'Amount': 2000.0, 'Checking Balance': 3000.0},
+        {'Date': '2026-01-01', 'Description': 'Extra payment to Loan', 'Amount': -200.0, 'Checking Balance': 1300.0},
+        {'Date': '2026-01-05', 'Description': 'Utility', 'Amount': -100.0, 'Checking Balance': 1200.0}
+    ]
+    # Sort per user specification: Date asc, Amount desc
+    sample_schedule.sort(key=lambda r: (r['Date'], -r['Amount']))
+    assert [r['Description'] for r in sample_schedule[:3]] == [
+        'Paycheck Received', 'Extra payment to Loan', 'Rent'
+    ]
+    # Recalculate running balance with initial checking 1000
+    running = 1000.0
+    for r in sample_schedule:
+        running += r['Amount']
+        r['Checking Balance'] = round(running, 2)
+    assert sample_schedule[0]['Checking Balance'] == 3000.0  # 1000 + 2000
+    assert sample_schedule[1]['Checking Balance'] == 2800.0  # 3000 - 200
+    assert sample_schedule[2]['Checking Balance'] == 1300.0  # 2800 - 1500
+    assert sample_schedule[3]['Checking Balance'] == 1200.0  # 1300 - 100
+    print("  -> Passed!")
+
+    # Test 32: ADB Interest Correctly Reflects Mid-Cycle Payoff (Lingering Interest)
+    print("Test 32: ADB Interest Correctly Reflects Mid-Cycle Payoff (Lingering Interest)...")
+    # Setup:
+    #   - Amex card, grace_active=False, APR=0.20, balance=1000.
+    #   - Start Jan 1. Due day 25, grace 25 days -> cycle closes Jan 31 (25 days before Feb 25 due).
+    #   - On Jan 1, Section 3 runs first: adds 1000 to adb_reg_acc for that day (days_in_cycle becomes 2,
+    #     since __init__ already seeded 1 day elapsed from Dec 31 prev cycle end).
+    #   - Then Section 4 pays off the full 1000 balance (extra payment). balance = 0.
+    #   - For Jan 2-31 (30 more days), balance=0, so adb_reg_acc += 0 each day.
+    #   - At Jan 31 cycle close: adb_reg = adb_reg_acc / days_in_cycle = (1000 * 2) / 32 = 62.5.
+    #     interest = 62.5 * (0.20/365) * 32 = $1.10 (lingering charge despite zero live balance).
+    #   - statement_balance = $1.10. Balance is > 0 and NOT zeroed out.
+    opt32 = DebtOptimizer(
+        {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 2, 5), 'Initial Checking Balance': 2000, 'Checking Buffer': 0},
+        [{'Card': 'AmexLingeringInt', 'Issuer': 'American Express', 'APR': 0.20, 'Balance': 1000, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 25, 'Statement Balance': 1000, 'Min Floor': 25, 'Grace Period Days': 25}],
+        [], [], {'Start Date': datetime.date(2026, 1, 25), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+    )
+    # Due day 25, grace 25 -> next_cycle_end = Jan 31; next_due = Jan 25
+    assert opt32.ccs[0].next_cycle_end == datetime.date(2026, 1, 31)
+    assert opt32.ccs[0].next_due == datetime.date(2026, 1, 25)
+    # __init__ seeds 1 day elapsed (Jan 1 start - Dec 31 prev cycle end) with adb_reg_acc = 1000 * 1
+    assert opt32.ccs[0].days_in_cycle == 1
+    assert opt32.ccs[0].adb_reg_acc == 1000.0 * 1
+
+    log32 = opt32.run()
+
+    # Extra payment fires on Jan 1 (Section 4 runs after Section 3).
+    # Section 3 on Jan 1 adds 1000 to ADB first (days becomes 2, acc becomes 2000).
+    # Then extra payment zeros balance. For Jan 2-31: adds 0 each day -> total days = 32, acc = 2000.
+    # At cycle close Jan 31: interest = (2000 / 32) * (0.20/365) * 32 = 2000 * 0.20/365 = $1.096 -> ~$1.10
+    extra_jan1 = [t for t in log32 if t['Date'] == '2026-01-01' and 'Extra payment' in t['Description']]
+    assert len(extra_jan1) == 1 and abs(extra_jan1[0]['Amount']) == 1000.0
+
+    cc32 = opt32.ccs[0]
+    # statement_balance must reflect lingering ADB interest, NOT zero
+    assert cc32.statement_balance > 0.0, "Expected lingering ADB interest on new statement"
+    assert cc32.statement_balance < 5.0, "Expected only a small interest charge, not the full balance"
+
+    # Verify the ADB math precisely:
+    # adb_reg_acc at close = 1000 * 2 days (1 from __init__ + 1 from Jan 1 Section 3)
+    # interest = adb_reg_acc * (apr / 365) = 2000 * (0.20 / 365) = $1.0959...
+    expected_interest = round(1000.0 * 2 * (0.20 / 365.0), 2)
+    assert abs(cc32.statement_balance - expected_interest) < 0.02, (
+        f"Expected ~${expected_interest} in lingering interest, got ${cc32.statement_balance}"
+    )
+    print(f"  -> Passed! (Lingering ADB interest on statement: ${cc32.statement_balance}, expected ~${expected_interest})")
+
     print("\n======================================================================")
-    print("ALL 23 MATHEMATICAL TESTS PASSED PERFECTLY!")
+    print("ALL 32 MATHEMATICAL TESTS PASSED PERFECTLY!")
     print("======================================================================\n")
 
 
@@ -804,6 +1068,17 @@ def parse_date(val: Any) -> Optional[datetime.date]:
         return val.date()
     
     val_str = str(val).strip()
+    if val_str.lower() in ('none', 'n/a', '-', '', 'null'):
+        return None
+
+    # Handle recurring MM/DD format (default year 2000)
+    if '/' in val_str and len(val_str.split('/')) == 2:
+        try:
+            m, d = map(int, val_str.split('/'))
+            return datetime.date(2000, m, d)
+        except ValueError:
+            pass
+
     for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%m/%d/%y', '%d/%m/%Y'):
         try:
             return datetime.datetime.strptime(val_str, fmt).date()
@@ -822,7 +1097,7 @@ def parse_float(val: Any, default: float = 0.0) -> float:
     try:
         f = float(s)
         # If original string had '%', convert percentage to decimal
-        if '%' in str(val) or ('APR' in str(val) and f > 1.0):
+        if '%' in str(val):
             return f / 100.0
         return f
     except ValueError:
@@ -887,40 +1162,51 @@ def run_optimizer_from_sheet(sheet_name: str, creds_path: str, token_path: str, 
         return
 
     print("Loading data from worksheets...")
+    alerts = []
     
     # 1. Parameters
     param_records = sheet.worksheet("Parameters").get_all_records()
     if not param_records:
         raise ValueError("Worksheet 'Parameters' is empty.")
     p = param_records[0]
+    start_d = parse_date(p.get('Start Date'))
+    end_d = parse_date(p.get('End Date'))
+    if not start_d:
+        alerts.append("Worksheet 'Parameters': 'Start Date' is missing or could not be parsed.")
+    if not end_d:
+        alerts.append("Worksheet 'Parameters': 'End Date' is missing or could not be parsed.")
+    if 'Initial Checking Balance' not in p or p.get('Initial Checking Balance') == '':
+        alerts.append("Worksheet 'Parameters': 'Initial Checking Balance' is missing.")
+    if 'Checking Buffer' not in p or p.get('Checking Buffer') == '':
+        alerts.append("Worksheet 'Parameters': 'Checking Buffer' is missing (defaulting to 0.0).")
+
     params = {
-        'Start Date': parse_date(p['Start Date']),
-        'End Date': parse_date(p['End Date']),
-        'Initial Checking Balance': parse_float(p['Initial Checking Balance']),
-        'Checking Buffer': parse_float(p['Checking Buffer'])
+        'Start Date': start_d,
+        'End Date': end_d,
+        'Initial Checking Balance': parse_float(p.get('Initial Checking Balance', 0.0)),
+        'Checking Buffer': parse_float(p.get('Checking Buffer', 0.0))
     }
     
     # 2. Credit Cards
     cc_records = sheet.worksheet("CreditCards").get_all_records()
     ccs = []
-    for c in cc_records:
-        ren_val = c.get('Renewal Date')
-        ren_date = None
-        if ren_val:
-            try:
-                # If only MM/DD or MM/DD/YYYY
-                s = str(ren_val).strip()
-                if '/' in s and len(s.split('/')) == 2:
-                    m, d = map(int, s.split('/'))
-                    ren_date = datetime.date(2000, m, d)
-                else:
-                    ren_date = parse_date(ren_val)
-            except Exception:
-                ren_date = None
+    for idx, c in enumerate(cc_records, start=2):
+        card_name = str(c.get('Card', f'Row {idx}')).strip()
+        issuer = str(c.get('Issuer', '')).strip()
+        if not issuer:
+            alerts.append(f"Worksheet 'CreditCards', row {idx} ({card_name}): 'Issuer' is missing.")
+        elif issuer == 'Chase' and not c.get('Statement Cycle End Day'):
+            alerts.append(f"Worksheet 'CreditCards', row {idx} ({card_name}): 'Statement Cycle End Day' is required for Chase cards.")
+        elif issuer == 'Citibank' and not c.get('Cycle End Nth Weekday'):
+            alerts.append(f"Worksheet 'CreditCards', row {idx} ({card_name}): 'Cycle End Nth Weekday' is required for Citibank cards.")
+        elif issuer in ('American Express', 'Capital One', 'Discover', 'X1') and not c.get('Grace Period Days'):
+            alerts.append(f"Worksheet 'CreditCards', row {idx} ({card_name}): 'Grace Period Days' is required for {issuer} cards.")
+        if 'Due Day' not in c or c.get('Due Day') == '':
+            alerts.append(f"Worksheet 'CreditCards', row {idx} ({card_name}): 'Due Day' is missing.")
 
         ccs.append({
-            'Card': str(c.get('Card', '')),
-            'Issuer': str(c.get('Issuer', '')).strip(),
+            'Card': card_name,
+            'Issuer': issuer,
             'APR': parse_apr(c.get('APR', 0)),
             'Balance': parse_float(c.get('Balance', 0)),
             'Promo Balance': parse_float(c.get('Promo Balance', 0)),
@@ -934,15 +1220,20 @@ def run_optimizer_from_sheet(sheet_name: str, creds_path: str, token_path: str, 
             'Min Floor': parse_float(c.get('Min Floor', 0)),
             'Min Percent': parse_float(c.get('Min Percent', 0.01)),
             'Annual Fee': parse_float(c.get('Annual Fee', 0)),
-            'Renewal Date': ren_date
+            'Renewal Date': parse_date(c.get('Renewal Date'))
         })
 
     # 3. Loans
     loan_records = sheet.worksheet("Loans").get_all_records()
     loans = []
-    for l in loan_records:
+    for idx, l in enumerate(loan_records, start=2):
+        loan_name = str(l.get('Name', f'Row {idx}')).strip()
+        if 'Due Day' not in l or l.get('Due Day') == '':
+            alerts.append(f"Worksheet 'Loans', row {idx} ({loan_name}): 'Due Day' is missing.")
+        if 'Minimum Payment' not in l or l.get('Minimum Payment') == '':
+            alerts.append(f"Worksheet 'Loans', row {idx} ({loan_name}): 'Minimum Payment' is missing.")
         loans.append({
-            'Name': str(l.get('Name', '')),
+            'Name': loan_name,
             'Amount Left': parse_float(l.get('Amount Left', 0)),
             'APR': parse_apr(l.get('APR', 0)),
             'Minimum Payment': parse_float(l.get('Minimum Payment', 0)),
@@ -952,9 +1243,14 @@ def run_optimizer_from_sheet(sheet_name: str, creds_path: str, token_path: str, 
     # 4. Monthly Payments
     monthly_records = sheet.worksheet("MonthlyPayments").get_all_records()
     monthly = []
-    for m in monthly_records:
+    for idx, m in enumerate(monthly_records, start=2):
+        m_name = str(m.get('Name', f'Row {idx}')).strip()
+        if 'Due Day' not in m or m.get('Due Day') == '':
+            alerts.append(f"Worksheet 'MonthlyPayments', row {idx} ({m_name}): 'Due Day' is missing.")
+        if 'Amount' not in m or m.get('Amount') == '':
+            alerts.append(f"Worksheet 'MonthlyPayments', row {idx} ({m_name}): 'Amount' is missing.")
         monthly.append({
-            'Name': str(m.get('Name', '')),
+            'Name': m_name,
             'Amount': parse_float(m.get('Amount', 0)),
             'Due Day': int(parse_float(m.get('Due Day', 1)))
         })
@@ -964,15 +1260,39 @@ def run_optimizer_from_sheet(sheet_name: str, creds_path: str, token_path: str, 
     if not income_records:
         raise ValueError("Worksheet 'Income' is empty.")
     inc = income_records[0]
+    inc_start = parse_date(inc.get('Start Date'))
+    if not inc_start:
+        alerts.append("Worksheet 'Income': 'Start Date' is missing or could not be parsed.")
     income = {
-        'Start Date': parse_date(inc.get('Start Date')),
+        'Start Date': inc_start,
         'Paycheck 2': parse_float(inc.get('Paycheck 2', 0)),
         'Paychecks 1 and 3': parse_float(inc.get('Paychecks 1 and 3', 0))
     }
 
+    # Alert user if any missing or incomplete information was detected
+    if alerts:
+        print("\n" + "!" * 75)
+        print("ALERT: MISSING OR INCOMPLETE INFORMATION DETECTED IN SPREADSHEET:")
+        for a in alerts:
+            print(f"  [!] {a}")
+        print("!" * 75 + "\n")
+        if not params['Start Date'] or not params['End Date'] or not income['Start Date']:
+            raise ValueError("Simulation halted: Required start/end dates are missing. See alerts above.")
+
     print("Data loaded successfully. Running Debt Minimizer optimization engine...")
     optimizer = DebtOptimizer(params, ccs, loans, monthly, income)
     schedule = optimizer.run()
+
+    # Format & Sort output ledger:
+    # 1. Date ascending
+    # 2. Within same date, Amount descending
+    schedule.sort(key=lambda r: (r['Date'], -r['Amount']))
+
+    # Recalculate running checking balance so ledger amounts are strictly cumulative
+    running_bal = float(params['Initial Checking Balance'])
+    for r in schedule:
+        running_bal += r['Amount']
+        r['Checking Balance'] = round(running_bal, 2)
 
     print(f"Optimization finished ({len(schedule)} transactions). Writing to 'Output' sheet...")
     try:
@@ -981,10 +1301,10 @@ def run_optimizer_from_sheet(sheet_name: str, creds_path: str, token_path: str, 
         output_ws = sheet.add_worksheet(title="Output", rows=len(schedule) + 10, cols=5)
 
     output_ws.clear()
-    headers = ["Description", "Amount", "Checking Balance", "Date"]
+    headers = ["Date", "Description", "Amount", "Checking Balance"]
     rows = [headers]
     for r in schedule:
-        rows.append([r['Description'], r['Amount'], r['Checking Balance'], r['Date']])
+        rows.append([r['Date'], r['Description'], r['Amount'], r['Checking Balance']])
         
     output_ws.update(rows)
     print("Success! Payment schedule successfully written to Google Sheet.")
