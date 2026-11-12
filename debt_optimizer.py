@@ -138,6 +138,7 @@ class DebtOptimizer:
         )
         
         self.schedule_log: List[Dict[str, Any]] = []
+        self.total_interest_paid: float = 0.0
         
         # Build Monthly Payments
         self.monthly: List[MonthlyPayment] = []
@@ -504,6 +505,7 @@ class DebtOptimizer:
                         int_pay = min(pay_amt, target.accrued_interest)
                         target.accrued_interest -= int_pay
                         target.amount_left -= (pay_amt - int_pay)
+                        self.total_interest_paid += int_pay
                         if target.amount_left < 0.005:
                             target.amount_left = 0.0
                             target.accrued_interest = 0.0
@@ -535,6 +537,7 @@ class DebtOptimizer:
                         int_pay = min(pay_amt, loan.accrued_interest)
                         loan.accrued_interest -= int_pay
                         loan.amount_left -= (pay_amt - int_pay)
+                        self.total_interest_paid += int_pay
                         if loan.amount_left < 0.005:
                             loan.amount_left = 0.0
                             loan.accrued_interest = 0.0
@@ -632,6 +635,7 @@ class DebtOptimizer:
                                 penalty_days = max(1, (cc.next_due - prev_cycle_end).days)
                             penalty = cc.statement_balance * (cc.apr / 365.0) * penalty_days
                             cc.balance += penalty
+                            self.total_interest_paid += penalty
                     else:
                         # Fix H: Grace restores only after 2 consecutive months of full statement payment.
                         # Interest accrues on lingering charges and new purchases between cycles, so a
@@ -659,6 +663,7 @@ class DebtOptimizer:
                         adb_reg = cc.adb_reg_acc / cc.days_in_cycle
                         interest = adb_reg * (cc.apr / 365.0) * cc.days_in_cycle
                         cc.balance += interest
+                        self.total_interest_paid += interest
                         
                     fees = cc.cycle_fees
                     cc.cycle_fees = 0.0
@@ -1441,16 +1446,26 @@ def run_optimizer_from_sheet(sheet_name: str, creds_path: str, token_path: str, 
     try:
         output_ws = sheet.worksheet("Output")
     except Exception:
-        output_ws = sheet.add_worksheet(title="Output", rows=len(schedule) + 10, cols=5)
+        output_ws = sheet.add_worksheet(title="Output", rows=len(schedule) + 10, cols=10)
+
+    # Ensure sheet has at least 7 columns for column G
+    if output_ws.col_count < 7:
+        output_ws.add_cols(7 - output_ws.col_count)
 
     output_ws.clear()
-    headers = ["Date", "Description", "Amount", "Checking Balance"]
+    headers = ["Date", "Description", "Amount", "Checking Balance", "", "", "Total Interest Paid"]
     rows = [headers]
-    for r in schedule:
-        rows.append([r['Date'], r['Description'], r['Amount'], r['Checking Balance']])
+    for idx, r in enumerate(schedule):
+        row = [r['Date'], r['Description'], r['Amount'], r['Checking Balance']]
+        if idx == 0:
+            row.extend(["", "", round(optimizer.total_interest_paid, 2)])
+        rows.append(row)
+
+    if not schedule:
+        rows.append(["", "", "", "", "", "", round(optimizer.total_interest_paid, 2)])
         
     output_ws.update(rows)
-    print("Success! Payment schedule successfully written to Google Sheet.")
+    print(f"Success! Payment schedule and total interest paid (${round(optimizer.total_interest_paid, 2):,.2f}) written to Google Sheet.")
 
 
 # =====================================================================
