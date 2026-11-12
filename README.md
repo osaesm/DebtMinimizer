@@ -125,6 +125,10 @@ The script generates an **`Output`** worksheet:
 
 ### Run Offline Mathematical Verification Test Suite
 ```bash
+# Run standalone test runner
+python test_debt_optimizer.py
+
+# Or via CLI flag
 python debt_optimizer.py --test
 ```
 
@@ -146,15 +150,16 @@ On first run, your browser opens to authorize OAuth 2.0 access. A cached `token.
 
 ## Test Coverage & Mathematical Verification
 
-The simulation engine is backed by a 36-scenario test suite verifying edge cases, complex issuer rules, and liquidity preservation.
+The simulation engine is backed by a 36-scenario test suite in `test_debt_optimizer.py` verifying edge cases, complex issuer rules, and liquidity preservation.
 
 ### Coverage Summary
 
 | Metric | Result |
 | :--- | :--- |
 | **Test Suite Pass Rate** | **36 / 36 (100%)** |
-| **Core Engine Coverage** | **~99%** |
-| **Total File Coverage** | **78%** *(uncovered lines are interactive Sheets I/O and CLI entrypoint)* |
+| **Core Engine (`debt_optimizer.py`)** | **~99% of engine logic** *(68% file total; remaining 32% is interactive Sheets API I/O)* |
+| **Test File (`test_debt_optimizer.py`)** | **99%** |
+| **Combined Codebase Coverage** | **78%** |
 
 ### Test Breakdown
 
