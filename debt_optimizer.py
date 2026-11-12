@@ -65,7 +65,6 @@ class CreditCard:
     grace_period_days: int      # For Amex, CapOne, Discover, X1
     cycle_end_nth_weekday: int  # For Citi
     min_floor: float
-    min_percent: float
     annual_fee: float
     renewal_date: Optional[datetime.date]
     
@@ -74,7 +73,6 @@ class CreditCard:
     cycle_due_date: datetime.date = field(default_factory=lambda: datetime.date(2000, 1, 1))
     next_cycle_end: datetime.date = field(default_factory=lambda: datetime.date(2000, 1, 1))
     adb_reg_acc: float = 0.0
-    adb_promo_acc: float = 0.0
     days_in_cycle: int = 0
     amount_paid_this_cycle: float = 0.0
     remaining_min_due: float = 0.0
@@ -93,6 +91,7 @@ class Loan:
     # Internal dynamic simulation state
     next_due: datetime.date = field(default_factory=lambda: datetime.date(2000, 1, 1))
     remaining_min_due: float = 0.0
+    accrued_interest: float = 0.0
     amount_paid_this_cycle: float = 0.0
 
 
@@ -195,7 +194,6 @@ class DebtOptimizer:
                 grace_period_days=int(c.get('Grace Period Days', 0) or 0),
                 cycle_end_nth_weekday=int(c.get('Cycle End Nth Weekday', 0) or 0),
                 min_floor=float(c.get('Min Floor', 0.0)),
-                min_percent=float(c.get('Min Percent', 0.01) or 0.01),
                 annual_fee=float(c.get('Annual Fee', 0.0) or 0.0),
                 renewal_date=ren_date
             )
@@ -243,7 +241,6 @@ class DebtOptimizer:
                 elapsed_days = (self.start_date - prev_cycle_end).days
                 cc_obj.days_in_cycle = max(0, elapsed_days)
                 cc_obj.adb_reg_acc = cc_obj.balance * cc_obj.days_in_cycle
-                cc_obj.adb_promo_acc = cc_obj.promo_balance * cc_obj.days_in_cycle
             
             # 5. Calculate initial minimum payment from starting statement balance
             cc_obj.remaining_min_due = self.calc_cc_min_payment(
@@ -295,6 +292,11 @@ class DebtOptimizer:
             count = 0
             d = datetime.date(y, m, 1)
             while True:
+                if d.month != m:
+                    raise ValueError(
+                        f"Citibank Cycle End Nth Weekday ({citi_weekday}) exceeds the number "
+                        f"of business days in {y}-{m:02d}."
+                    )
                 if d.weekday() < 5:  # Monday = 0 ... Friday = 4
                     count += 1
                     if count == citi_weekday:
@@ -360,10 +362,10 @@ class DebtOptimizer:
             # -------------------------------------------------------------
             for loan in self.loans:
                 if loan.amount_left > 0.005:
-                    daily_interest = loan.amount_left * (loan.apr / 365.0)
-                    loan.amount_left += daily_interest
+                    loan.accrued_interest += loan.amount_left * (loan.apr / 365.0)
                 else:
                     loan.amount_left = 0.0
+                    loan.accrued_interest = 0.0
                     loan.remaining_min_due = 0.0
                     
             for cc in self.ccs:
@@ -379,7 +381,6 @@ class DebtOptimizer:
                     cc.promo_balance = 0.0
 
                 cc.adb_reg_acc += cc.balance
-                cc.adb_promo_acc += cc.promo_balance
                 cc.days_in_cycle += 1
 
             # -------------------------------------------------------------
@@ -398,7 +399,7 @@ class DebtOptimizer:
                             mandatory_total += m.amount
                     for loan in self.loans:
                         if loan.amount_left > 0.005 and d == loan.next_due:
-                            mandatory_total += min(loan.amount_left, loan.remaining_min_due)
+                            mandatory_total += min(loan.amount_left + loan.accrued_interest, loan.remaining_min_due)
                     for cc in self.ccs:
                         if d == cc.next_due:
                             total_owed = round(cc.balance + cc.promo_balance, 2)
@@ -441,10 +442,15 @@ class DebtOptimizer:
                         self.log_transaction(f"Extra payment to {target.card}", -pay_amt)
                         disposable -= pay_amt
                     else:
-                        pay_amt = min(disposable, target.amount_left)
-                        target.amount_left -= pay_amt
+                        total_loan_owed = target.amount_left + target.accrued_interest
+                        pay_amt = min(disposable, total_loan_owed)
+                        # Simple interest: pay accrued interest first, then reduce principal
+                        int_pay = min(pay_amt, target.accrued_interest)
+                        target.accrued_interest -= int_pay
+                        target.amount_left -= (pay_amt - int_pay)
                         if target.amount_left < 0.005:
                             target.amount_left = 0.0
+                            target.accrued_interest = 0.0
                             target.remaining_min_due = 0.0
                         # Rule 9: Early payment updates remaining minimum
                         target.remaining_min_due = max(0.0, target.remaining_min_due - pay_amt)
@@ -465,15 +471,20 @@ class DebtOptimizer:
             for loan in self.loans:
                 if loan.amount_left > 0.005 and self.current_date == loan.next_due:
                     # Due is remaining minimum or remaining balance (Rule 10)
-                    due_amt = min(loan.amount_left, loan.remaining_min_due)
+                    total_loan_owed = loan.amount_left + loan.accrued_interest
+                    due_amt = min(total_loan_owed, loan.remaining_min_due)
                     pay_amt = min(due_amt, self.checking)  # Cap at checking if deficit
                     if pay_amt > 0:
-                        loan.amount_left -= pay_amt
+                        # Simple interest: pay accrued interest first, then reduce principal
+                        int_pay = min(pay_amt, loan.accrued_interest)
+                        loan.accrued_interest -= int_pay
+                        loan.amount_left -= (pay_amt - int_pay)
                         if loan.amount_left < 0.005:
                             loan.amount_left = 0.0
+                            loan.accrued_interest = 0.0
                             loan.remaining_min_due = 0.0
                         self.log_transaction(f"Loan Payment: {loan.name}", -pay_amt)
-                    loan.remaining_min_due = min(loan.amount_left, loan.minimum_payment)
+                    loan.remaining_min_due = min(loan.amount_left + loan.accrued_interest, loan.minimum_payment)
                     loan.amount_paid_this_cycle = 0.0
                     loan.next_due = advance_month(loan.next_due, loan.due_day)
                     
@@ -543,7 +554,27 @@ class DebtOptimizer:
                             cc.grace_active = False
                             cc.consecutive_full_payments = 0
                             # Retroactive interest applied to CC balance (NOT checking account)
-                            penalty = cc.statement_balance * (cc.apr / 365.0) * 30.0
+                            if cc.issuer == 'Chase':
+                                prev_cycle_end = self.calculate_cycle_end_date(
+                                    cc.issuer, cc.next_due, cc.grace_period_days,
+                                    cc.cycle_end_nth_weekday, cc.statement_cycle_end_day
+                                )
+                                penalty_days = max(1, (cc.next_due - prev_cycle_end).days)
+                            elif cc.issuer == 'Citibank':
+                                prev_cycle_end = self.calculate_cycle_end_date(
+                                    cc.issuer, cc.next_due, cc.grace_period_days,
+                                    cc.cycle_end_nth_weekday, cc.statement_cycle_end_day
+                                )
+                                penalty_days = max(1, (cc.next_due - prev_cycle_end).days)
+                            elif cc.grace_period_days > 0:
+                                penalty_days = cc.grace_period_days
+                            else:
+                                prev_cycle_end = self.calculate_cycle_end_date(
+                                    cc.issuer, cc.next_due, cc.grace_period_days,
+                                    cc.cycle_end_nth_weekday, cc.statement_cycle_end_day
+                                )
+                                penalty_days = max(1, (cc.next_due - prev_cycle_end).days)
+                            penalty = cc.statement_balance * (cc.apr / 365.0) * penalty_days
                             cc.balance += penalty
                     else:
                         # Fix H: Grace restores only after 2 consecutive months of full statement payment.
@@ -583,7 +614,6 @@ class DebtOptimizer:
                     
                     # Reset cycle accumulators
                     cc.adb_reg_acc = 0.0
-                    cc.adb_promo_acc = 0.0
                     cc.days_in_cycle = 0
                     cc.amount_paid_this_cycle = 0.0  # Fix G: Reset for the new statement cycle
                     
@@ -605,7 +635,7 @@ class DebtOptimizer:
 
 def run_self_tests():
     print("======================================================================")
-    print("Running Full Suite of Mathematical Tests (7 Original + 24 Extended Scenarios)")
+    print("Running Full Suite of Mathematical Tests (35 Comprehensive Scenarios)")
     print("======================================================================")
 
     base_income = {'Start Date': datetime.date(2026, 1, 1), 'Paycheck 2': 2200, 'Paychecks 1 and 3': 2000}
@@ -653,7 +683,7 @@ def run_self_tests():
     )
     opt5.run()
     assert opt5.ccs[0].grace_active is False
-    assert round(opt5.ccs[0].balance, 2) == 966.44  # 1000 - 50 paid + 16.44 retro penalty
+    assert round(opt5.ccs[0].balance, 2) == 964.25  # 1000 - 50 paid + 14.25 retro penalty (26 days from Dec 25)
     print("  -> Passed!")
 
     # Test 6: Original 4A - Dipping into Checking Buffer for Mandatory Payments
@@ -1049,8 +1079,44 @@ def run_self_tests():
     )
     print(f"  -> Passed! (Lingering ADB interest on statement: ${cc32.statement_balance}, expected ~${expected_interest})")
 
+    # Test 33: Citibank Infinite-Loop Guard on Out-of-Bounds Weekday
+    print("Test 33: Citibank Infinite-Loop Guard on Out-of-Bounds Weekday...")
+    try:
+        DebtOptimizer.calculate_cycle_end_date('Citibank', datetime.date(2026, 7, 10), 0, 50, 0)
+        assert False, "Expected ValueError for out-of-bounds Citibank weekday"
+    except ValueError as e:
+        assert "exceeds the number of business days" in str(e)
+    print("  -> Passed!")
+
+    # Test 34: Retroactive Grace Penalty Uses Issuer/Card Grace Period (Amex)
+    print("Test 34: Retroactive Grace Penalty Uses Issuer/Card Grace Period...")
+    opt34 = DebtOptimizer(
+        {'Start Date': datetime.date(2026, 1, 24), 'End Date': datetime.date(2026, 1, 26), 'Initial Checking Balance': 50, 'Checking Buffer': 0},
+        [{'Card': 'AmexGrace', 'Issuer': 'American Express', 'APR': 0.20, 'Balance': 1000, 'Promo Balance': 0, 'Grace Active': True, 'Due Day': 25, 'Statement Balance': 1000, 'Min Floor': 25, 'Grace Period Days': 25}],
+        [], [], base_income
+    )
+    opt34.run()
+    assert opt34.ccs[0].grace_active is False
+    # Penalty uses exact 25 grace days (not hardcoded 30): 1000 * (0.20/365) * 25 = 13.70
+    assert round(opt34.ccs[0].balance, 2) == 963.70  # 1000 - 50 paid + 13.70 retro penalty
+    print("  -> Passed!")
+
+    # Test 35: Simple Interest Loan Accrual (No Daily Principal Compounding)
+    print("Test 35: Simple Interest Loan Accrual (No Daily Principal Compounding)...")
+    opt35 = DebtOptimizer(
+        {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 1, 5), 'Initial Checking Balance': 0, 'Checking Buffer': 0},
+        [], [{'Name': 'AutoLoan', 'Amount Left': 10000.0, 'APR': 0.10, 'Minimum Payment': 300, 'Due Day': 15}], [],
+        {'Start Date': datetime.date(2026, 1, 15), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+    )
+    opt35.run()
+    loan35 = opt35.loans[0]
+    assert loan35.amount_left == 10000.0, "Principal must remain constant without daily compounding"
+    expected_simple_int = round(10000.0 * (0.10 / 365.0) * 5, 2)
+    assert round(loan35.accrued_interest, 2) == expected_simple_int
+    print("  -> Passed!")
+
     print("\n======================================================================")
-    print("ALL 32 MATHEMATICAL TESTS PASSED PERFECTLY!")
+    print("ALL 35 MATHEMATICAL TESTS PASSED PERFECTLY!")
     print("======================================================================\n")
 
 
@@ -1218,7 +1284,6 @@ def run_optimizer_from_sheet(sheet_name: str, creds_path: str, token_path: str, 
             'Grace Period Days': int(parse_float(c.get('Grace Period Days', 0))),
             'Cycle End Nth Weekday': int(parse_float(c.get('Cycle End Nth Weekday', 0))),
             'Min Floor': parse_float(c.get('Min Floor', 0)),
-            'Min Percent': parse_float(c.get('Min Percent', 0.01)),
             'Annual Fee': parse_float(c.get('Annual Fee', 0)),
             'Renewal Date': parse_date(c.get('Renewal Date'))
         })
@@ -1325,8 +1390,8 @@ def parse_args():
     )
     parser.add_argument(
         "--sheet", 
-        default="Debt Optimization Sheet", 
-        help="Google Spreadsheet title (default: 'Debt Optimization Sheet')."
+        default="Bank Balance Script 2", 
+        help="Google Spreadsheet title (default: 'Bank Balance Script 2')."
     )
     parser.add_argument(
         "--creds", 
