@@ -6,3 +6,4 @@ service_account.json
 *.env
 *.key
 *.pem
+.coverage
