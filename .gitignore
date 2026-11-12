@@ -2,3 +2,7 @@ __pycache__
 venv
 credentials.json
 token.json
+service_account.json
+*.env
+*.key
+*.pem
