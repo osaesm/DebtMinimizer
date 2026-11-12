@@ -526,8 +526,32 @@ def run_self_tests():
     assert all(t['Checking Balance'] >= 300.0 for t in schedule36), "Checking balance must never dip below buffer"
     print("  -> Passed!")
 
+    # Test 37: Two-Pass LP Optimal Allocation & Split Across Multiple Debts
+    print("Test 37: Two-Pass LP Optimal Allocation & Split Across Competing Debts...")
+    opt37 = DebtOptimizer(
+        {'Start Date': datetime.date(2026, 3, 1), 'End Date': datetime.date(2026, 3, 10), 'Initial Checking Balance': 1500.0, 'Checking Buffer': 500.0},
+        [{'Card': 'Card1', 'Issuer': 'Chase', 'APR': 0.24, 'Balance': 600.0, 'Promo Balance': 0.0, 'Promo End Date': None, 'Statement Cycle End Day': 20, 'Statement Balance': 600.0, 'Grace Active': False, 'Due Day': 20, 'Grace Period Days': 25, 'Cycle End Nth Weekday': 0, 'Min Floor': 40.0, 'Annual Fee': 0.0, 'Renewal Date': None}],
+        [{'Name': 'Loan1', 'Amount Left': 2000.0, 'APR': 0.12, 'Minimum Payment': 100.0, 'Due Day': 25}],
+        [],
+        {'Start Date': datetime.date(2026, 4, 1), 'Paycheck 2': 1000.0, 'Paychecks 1 and 3': 1000.0}
+    )
+    schedule37 = opt37.run()
+    # Disposable cash is $1000 (1500 - 500 buffer).
+    # Card1 (24% APR) should receive $600 (full payoff).
+    # Loan1 (12% APR) should receive the remaining $400.
+    # Buffer $500.0 must be preserved.
+    c1_extra = [t for t in schedule37 if 'Extra payment to Card1' in t['Description']]
+    l1_extra = [t for t in schedule37 if 'Extra payment to Loan1' in t['Description']]
+    assert len(c1_extra) == 1 and abs(c1_extra[0]['Amount']) == 600.0, "Card1 should receive $600"
+    assert len(l1_extra) == 1 and abs(l1_extra[0]['Amount']) == 400.0, "Loan1 should receive $400"
+    assert round(opt37.ccs[0].balance, 2) == 0.0, "Card1 balance should be 0.0"
+    # Simple interest rule: the 400 payment satisfies day-1 accrued interest ($0.66) first, then principal
+    assert round(opt37.loans[0].amount_left, 2) == 1600.66, "Loan1 principal should be reduced to 1600.66"
+    assert opt37.checking == 500.0, "Checking must match buffer floor"
+    print("  -> Passed!")
+
     print("\n======================================================================")
-    print("ALL 36 MATHEMATICAL TESTS PASSED PERFECTLY!")
+    print("ALL 37 MATHEMATICAL TESTS PASSED PERFECTLY!")
     print("======================================================================\n")
 
 

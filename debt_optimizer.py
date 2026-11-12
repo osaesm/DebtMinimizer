@@ -2,11 +2,15 @@ import datetime
 from datetime import timedelta
 import calendar
 from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 import copy
 import argparse
 import sys
 import os
+
+import numpy as np
+from scipy.optimize import linprog
+from scipy.sparse import csr_matrix
 
 # Optional imports for Google Sheets I/O
 try:
@@ -341,20 +345,29 @@ class DebtOptimizer:
             'Checking Balance': round(self.checking, 2)
         })
 
-    def calculate_disposable_cash(self) -> float:
+    def _pass1_project_cash_flows(self) -> np.ndarray:
         """
-        Calculates safe disposable cash for extra debt payments.
-        Simulates forward baseline cash flows from current_date to end_date
-        to guarantee checking balance never breaches buffer at any future point.
-        """
-        if self.checking <= self.buffer:
-            return 0.0
+        Pass 1 of the two-pass LP solver.
 
+        Walks day-by-day from current_date to end_date simulating ONLY mandatory
+        cash flows: paychecks (inflows), monthly bills, loan minimums, and CC
+        minimums / statement balance payments. No extra payments are simulated.
+
+        Returns available_cash[t] where available_cash[t] is the maximum extra
+        payment that could safely be made on day t without breaching the buffer,
+        BEFORE any extra payments from prior days are considered. The LP pass
+        accounts for the cross-day budget correctly.
+
+        Note: today's paycheck is already in self.checking (Step 2 of run() fires
+        before Step 4), so day t=0 does not add it again.
+        """
+        T = (self.end_date - self.current_date).days + 1
+        available_cash = np.zeros(T)
         proj_bal = self.checking
-        min_margin = proj_bal - self.buffer
 
-        # Lightweight forward trackers
-        m_trackers = [{'amount': m.amount, 'due_day': m.due_day, 'next_due': m.next_due} for m in self.monthly]
+        # Lightweight forward trackers (same structure as the old lookahead)
+        m_trackers = [{'amount': m.amount, 'due_day': m.due_day, 'next_due': m.next_due}
+                      for m in self.monthly]
         loan_trackers = [{
             'bal': l.amount_left + l.accrued_interest,
             'due_day': l.due_day,
@@ -376,27 +389,28 @@ class DebtOptimizer:
             'renewal_date': cc.renewal_date
         } for cc in self.ccs]
 
-        d = self.current_date
-        while d <= self.end_date:
-            # 0. Annual fee posting on future dates
-            if d > self.current_date:
+        for t in range(T):
+            d = self.current_date + timedelta(days=t)
+
+            # Annual fees (future dates only; today's already applied in Step 1 of run())
+            if t > 0:
                 for cc in cc_trackers:
                     if cc['annual_fee'] > 0 and cc['renewal_date']:
                         target_day = clamp_day(d.year, cc['renewal_date'].month, cc['renewal_date'].day)
                         if d.month == cc['renewal_date'].month and d.day == target_day:
                             cc['bal'] += cc['annual_fee']
 
-            # 1. Inflow on future paydays (current_date paycheck is already in self.checking)
-            if d > self.current_date and self.is_payday(d):
+            # Paychecks (t=0 already applied; skip)
+            if t > 0 and self.is_payday(d):
                 proj_bal += self.get_paycheck_amount(d)
 
-            # 2. Monthly payments
+            # Monthly bills
             for m in m_trackers:
                 if d == m['next_due']:
                     proj_bal -= m['amount']
                     m['next_due'] = advance_month(m['next_due'], m['due_day'])
 
-            # 3. Loan payments
+            # Loan minimums
             for l in loan_trackers:
                 if l['bal'] > 0.005 and d == l['next_due']:
                     due_amt = min(l['bal'], l['rem_min'])
@@ -405,7 +419,7 @@ class DebtOptimizer:
                     l['rem_min'] = min(l['bal'], l['min_pay'])
                     l['next_due'] = advance_month(l['next_due'], l['due_day'])
 
-            # 4. Credit card payments
+            # CC minimum / statement payments
             for cc in cc_trackers:
                 if cc['bal'] > 0.005 and d == cc['next_due']:
                     if cc['grace']:
@@ -417,19 +431,118 @@ class DebtOptimizer:
                     cc['bal'] = max(0.0, cc['bal'] - due_amt)
                     cc['stmt_bal'] = cc['bal']
                     cc['paid_cycle'] = 0.0
-                    cc['rem_min'] = self.calc_cc_min_payment(cc['issuer'], cc['stmt_bal'], cc['min_floor'], 0.0, 0.0)
+                    cc['rem_min'] = self.calc_cc_min_payment(
+                        cc['issuer'], cc['stmt_bal'], cc['min_floor'], 0.0, 0.0
+                    )
                     cc['next_due'] = advance_month(cc['next_due'], cc['due_day'])
 
-            # Evaluate cushion
-            margin = proj_bal - self.buffer
-            if margin < min_margin:
-                min_margin = margin
-                if min_margin <= 0.01:
-                    return 0.0
+            # Day t's ceiling: cash above buffer after mandatory flows
+            available_cash[t] = max(0.0, proj_bal - self.buffer)
 
-            d += timedelta(days=1)
+        return available_cash
 
-        return max(0.0, round(min_margin, 2))
+    def _pass2_solve_lp(self, available_cash: np.ndarray) -> Dict[str, float]:
+        """
+        Pass 2 of the two-pass LP solver.
+
+        Given the per-day available-cash envelope from Pass 1, finds the globally
+        optimal extra-payment allocation across all debts and all remaining days
+        that minimises total interest paid.
+
+        LP formulation
+        --------------
+        Variables  : x[i, t]  — extra dollars paid to debt i on day t  (≥ 0)
+        Objective  : minimise  -∑_{i,t}  rate_i · (T - t) · x[i, t]
+                     (maximise interest saved; paying earlier saves more days of
+                      accrual; rate_i = APR_i / 365)
+        Constraints:
+          (A) Daily budget  : ∑_i x[i, t] ≤ available_cash[t]   for each t
+          (B) Total payoff  : ∑_t x[i, t] ≤ balance_i            for each i
+          (C) Bounds        : x[i, t] ≥ 0
+
+        Returns today's allocation {debt_name: amount} (t=0 slice of optimal x).
+        Returns {} on failure or when no actionable debts exist.
+        """
+        # Collect interest-bearing debts eligible for extra payments
+        # Grace-period CCs are excluded (effective rate = 0; no extra benefit)
+        debts: List[Tuple[str, float, float]] = []  # (name, daily_rate, balance)
+        for cc in self.ccs:
+            if cc.balance > 0.005 and not cc.grace_active and cc.apr > 0:
+                debts.append((cc.card, cc.apr / 365.0, cc.balance))
+        for loan in self.loans:
+            total_loan = loan.amount_left + loan.accrued_interest
+            if total_loan > 0.005 and loan.apr > 0:
+                debts.append((loan.name, loan.apr / 365.0, total_loan))
+
+        if not debts or available_cash[0] <= 0.005:
+            return {}
+
+        N = len(debts)
+        T = len(available_cash)
+        n_vars = N * T  # x[i*T + t]
+
+        # --- Objective vector (minimise negative interest saved) ---
+        # Coefficient for x[i,t]: -rate_i * (T - t)
+        # Paying one dollar to debt i on day t saves rate_i interest per remaining day.
+        c = np.empty(n_vars)
+        for i, (_, rate, _) in enumerate(debts):
+            remaining = np.arange(T, 0, -1, dtype=float)  # T, T-1, ..., 1
+            c[i * T: (i + 1) * T] = -rate * remaining
+
+        # --- Constraint (A): Cumulative cash flow budget ---
+        # Any extra payment made on day s <= t reduces checking balance on day t.
+        # Thus, for each day t: ∑_{s≤t} ∑_i x[i, s] ≤ available_cash[t]
+        t_indices = []
+        c_indices = []
+        for t in range(T):
+            for i in range(N):
+                c_indices.extend(i * T + np.arange(t + 1))
+            t_indices.extend([t] * (N * (t + 1)))
+        rows_a = np.array(t_indices, dtype=np.int32)
+        cols_a = np.array(c_indices, dtype=np.int32)
+        data_a = np.ones(len(t_indices), dtype=float)
+
+        # --- Constraint (B): total payoff cap ∑_t x[i,t] ≤ balance_i ---
+        # N rows; row i has ones at columns i*T .. i*T+T-1
+        rows_b = np.repeat(np.arange(N), T)
+        cols_b = np.arange(N * T)
+        data_b = np.ones(N * T)
+
+        n_constraints = T + N
+        all_rows = np.concatenate([rows_a, rows_b + T])
+        all_cols = np.concatenate([cols_a, cols_b])
+        all_data = np.concatenate([data_a, data_b])
+
+        A_ub = csr_matrix((all_data, (all_rows, all_cols)), shape=(n_constraints, n_vars))
+        b_ub = np.concatenate([available_cash, np.array([bal for _, _, bal in debts])])
+
+        bounds = [(0.0, None)] * n_vars
+
+        result = linprog(c, A_ub=A_ub, b_ub=b_ub, bounds=bounds, method='highs')
+
+        if not result.success:
+            return {}
+
+        # Extract t=0 slice (today's allocation)
+        allocation: Dict[str, float] = {}
+        for i, (name, _, _) in enumerate(debts):
+            amt = float(result.x[i * T])  # x[i, t=0]
+            if amt > 0.005:
+                allocation[name] = round(amt, 2)
+
+        return allocation
+
+    def calculate_disposable_cash(self) -> float:
+        """
+        Backwards-compatible helper returning the maximum safe disposable cash
+        cushion across the forward horizon from current_date to end_date.
+        """
+        if self.checking <= self.buffer:
+            return 0.0
+        available_cash = self._pass1_project_cash_flows()
+        if len(available_cash) == 0:
+            return 0.0
+        return max(0.0, round(float(np.min(available_cash)), 2))
 
     def run(self) -> List[Dict[str, Any]]:
         while self.current_date <= self.end_date:
@@ -476,56 +589,52 @@ class DebtOptimizer:
                 cc.days_in_cycle += 1
 
             # -------------------------------------------------------------
-            # 4. Look-Ahead Optimizer & Extra Payments
+            # 4. Two-Pass LP Optimizer & Extra Payments
             # -------------------------------------------------------------
-            # Run extra payment optimizer when checking balance exceeds buffer
+            # Pass 1: project mandatory cash flows → per-day available_cash envelope
+            # Pass 2: solve LP → today's optimal allocation across all debts
             if self.checking > self.buffer:
-                disposable = self.calculate_disposable_cash()
-                
-                # Waterfall extra payments to highest APR interest-bearing debt
-                while disposable > 0.01:
-                    candidates = []
-                    for cc in self.ccs:
-                        # Extra payments only target interest-bearing balance
-                        if cc.balance > 0 and not cc.grace_active and cc.apr > 0:
-                            candidates.append(('cc', cc.apr, cc))
-                    for loan in self.loans:
-                        if loan.amount_left > 0 and loan.apr > 0:
-                            candidates.append(('loan', loan.apr, loan))
-                            
-                    if not candidates:
-                        break
-                        
-                    candidates.sort(key=lambda x: x[1], reverse=True)
-                    target_type, _, target = candidates[0]
-                    
-                    if target_type == 'cc':
-                        pay_amt = min(disposable, target.balance)
-                        target.balance -= pay_amt
-                        if target.balance < 0.005:
-                            target.balance = 0.0
-                        # Rule 9: Early payment updates remaining minimum
-                        target.remaining_min_due = max(0.0, target.remaining_min_due - pay_amt)
-                        target.amount_paid_this_cycle += pay_amt
-                        self.log_transaction(f"Extra payment to {target.card}", -pay_amt)
-                        disposable -= pay_amt
+                available_cash = self._pass1_project_cash_flows()
+                allocation = self._pass2_solve_lp(available_cash)
+
+                for debt_name, pay_amt in allocation.items():
+                    if pay_amt <= 0.005:
+                        continue
+
+                    # Identify target (CC or loan) by name
+                    cc_target = next((cc for cc in self.ccs if cc.card == debt_name), None)
+                    if cc_target is not None:
+                        pay_amt = min(pay_amt, cc_target.balance)
+                        if pay_amt <= 0.005:
+                            continue
+                        cc_target.balance -= pay_amt
+                        if cc_target.balance < 0.005:
+                            cc_target.balance = 0.0
+                        # Rule 9: early payment reduces remaining minimum due
+                        cc_target.remaining_min_due = max(0.0, cc_target.remaining_min_due - pay_amt)
+                        cc_target.amount_paid_this_cycle += pay_amt
+                        self.log_transaction(f"Extra payment to {cc_target.card}", -pay_amt)
                     else:
-                        total_loan_owed = target.amount_left + target.accrued_interest
-                        pay_amt = min(disposable, total_loan_owed)
+                        loan_target = next((l for l in self.loans if l.name == debt_name), None)
+                        if loan_target is None:
+                            continue
+                        total_loan_owed = loan_target.amount_left + loan_target.accrued_interest
+                        pay_amt = min(pay_amt, total_loan_owed)
+                        if pay_amt <= 0.005:
+                            continue
                         # Simple interest: pay accrued interest first, then reduce principal
-                        int_pay = min(pay_amt, target.accrued_interest)
-                        target.accrued_interest -= int_pay
-                        target.amount_left -= (pay_amt - int_pay)
+                        int_pay = min(pay_amt, loan_target.accrued_interest)
+                        loan_target.accrued_interest -= int_pay
+                        loan_target.amount_left -= (pay_amt - int_pay)
                         self.total_interest_paid += int_pay
-                        if target.amount_left < 0.005:
-                            target.amount_left = 0.0
-                            target.accrued_interest = 0.0
-                            target.remaining_min_due = 0.0
-                        # Rule 9: Early payment updates remaining minimum
-                        target.remaining_min_due = max(0.0, target.remaining_min_due - pay_amt)
-                        target.amount_paid_this_cycle += pay_amt
-                        self.log_transaction(f"Extra payment to {target.name}", -pay_amt)
-                        disposable -= pay_amt
+                        if loan_target.amount_left < 0.005:
+                            loan_target.amount_left = 0.0
+                            loan_target.accrued_interest = 0.0
+                            loan_target.remaining_min_due = 0.0
+                        # Rule 9: early payment reduces remaining minimum due
+                        loan_target.remaining_min_due = max(0.0, loan_target.remaining_min_due - pay_amt)
+                        loan_target.amount_paid_this_cycle += pay_amt
+                        self.log_transaction(f"Extra payment to {loan_target.name}", -pay_amt)
 
             # -------------------------------------------------------------
             # 5. Process Mandatory Payments Due Today
