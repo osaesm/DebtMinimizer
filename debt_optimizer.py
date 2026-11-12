@@ -339,6 +339,86 @@ class DebtOptimizer:
             'Checking Balance': round(self.checking, 2)
         })
 
+    def calculate_disposable_cash(self) -> float:
+        """
+        Calculates safe disposable cash for extra debt payments.
+        Simulates forward baseline cash flows from current_date to end_date
+        to guarantee checking balance never breaches buffer at any future point.
+        """
+        if self.checking <= self.buffer:
+            return 0.0
+
+        proj_bal = self.checking
+        min_margin = proj_bal - self.buffer
+
+        # Lightweight forward trackers
+        m_trackers = [{'amount': m.amount, 'due_day': m.due_day, 'next_due': m.next_due} for m in self.monthly]
+        loan_trackers = [{
+            'bal': l.amount_left + l.accrued_interest,
+            'due_day': l.due_day,
+            'next_due': l.next_due,
+            'rem_min': l.remaining_min_due,
+            'min_pay': l.minimum_payment
+        } for l in self.loans]
+        cc_trackers = [{
+            'bal': cc.balance + cc.promo_balance,
+            'due_day': cc.due_day,
+            'next_due': cc.next_due,
+            'rem_min': cc.remaining_min_due,
+            'stmt_bal': cc.statement_balance,
+            'paid_cycle': cc.amount_paid_this_cycle,
+            'grace': cc.grace_active,
+            'min_floor': cc.min_floor,
+            'issuer': cc.issuer
+        } for cc in self.ccs]
+
+        d = self.current_date
+        while d <= self.end_date:
+            # 1. Inflow on future paydays (current_date paycheck is already in self.checking)
+            if d > self.current_date and self.is_payday(d):
+                proj_bal += self.get_paycheck_amount(d)
+
+            # 2. Monthly payments
+            for m in m_trackers:
+                if d == m['next_due']:
+                    proj_bal -= m['amount']
+                    m['next_due'] = advance_month(m['next_due'], m['due_day'])
+
+            # 3. Loan payments
+            for l in loan_trackers:
+                if l['bal'] > 0.005 and d == l['next_due']:
+                    due_amt = min(l['bal'], l['rem_min'])
+                    proj_bal -= due_amt
+                    l['bal'] = max(0.0, l['bal'] - due_amt)
+                    l['rem_min'] = min(l['bal'], l['min_pay'])
+                    l['next_due'] = advance_month(l['next_due'], l['due_day'])
+
+            # 4. Credit card payments
+            for cc in cc_trackers:
+                if cc['bal'] > 0.005 and d == cc['next_due']:
+                    if cc['grace']:
+                        needed = max(cc['rem_min'], cc['stmt_bal'] - cc['paid_cycle'])
+                        due_amt = min(needed, cc['bal'])
+                    else:
+                        due_amt = min(cc['rem_min'], cc['bal'])
+                    proj_bal -= due_amt
+                    cc['bal'] = max(0.0, cc['bal'] - due_amt)
+                    cc['stmt_bal'] = cc['bal']
+                    cc['paid_cycle'] = 0.0
+                    cc['rem_min'] = self.calc_cc_min_payment(cc['issuer'], cc['stmt_bal'], cc['min_floor'], 0.0, 0.0)
+                    cc['next_due'] = advance_month(cc['next_due'], cc['due_day'])
+
+            # Evaluate cushion
+            margin = proj_bal - self.buffer
+            if margin < min_margin:
+                min_margin = margin
+                if min_margin <= 0.01:
+                    return 0.0
+
+            d += timedelta(days=1)
+
+        return max(0.0, round(min_margin, 2))
+
     def run(self) -> List[Dict[str, Any]]:
         while self.current_date <= self.end_date:
             # -------------------------------------------------------------
@@ -388,31 +468,7 @@ class DebtOptimizer:
             # -------------------------------------------------------------
             # Run extra payment optimizer when checking balance exceeds buffer
             if self.checking > self.buffer:
-                next_payday = self.get_next_payday()
-                mandatory_total = 0.0
-                
-                # Check all mandatory obligations strictly before next payday arrives
-                d = self.current_date
-                while d < next_payday and d <= self.end_date:
-                    for m in self.monthly:
-                        if d == m.next_due:
-                            mandatory_total += m.amount
-                    for loan in self.loans:
-                        if loan.amount_left > 0.005 and d == loan.next_due:
-                            mandatory_total += min(loan.amount_left + loan.accrued_interest, loan.remaining_min_due)
-                    for cc in self.ccs:
-                        if d == cc.next_due:
-                            total_owed = round(cc.balance + cc.promo_balance, 2)
-                            if total_owed > 0.005:
-                                if cc.grace_active:
-                                    # Rule 4: Reserve statement balance to keep grace active
-                                    needed = max(cc.remaining_min_due, cc.statement_balance - cc.amount_paid_this_cycle)
-                                    mandatory_total += min(needed, total_owed)
-                                else:
-                                    mandatory_total += min(cc.remaining_min_due, total_owed)
-                    d += timedelta(days=1)
-                    
-                disposable = self.checking - self.buffer - mandatory_total
+                disposable = self.calculate_disposable_cash()
                 
                 # Waterfall extra payments to highest APR interest-bearing debt
                 while disposable > 0.01:
@@ -635,7 +691,7 @@ class DebtOptimizer:
 
 def run_self_tests():
     print("======================================================================")
-    print("Running Full Suite of Mathematical Tests (35 Comprehensive Scenarios)")
+    print("Running Full Suite of Mathematical Tests (36 Comprehensive Scenarios)")
     print("======================================================================")
 
     base_income = {'Start Date': datetime.date(2026, 1, 1), 'Paycheck 2': 2200, 'Paychecks 1 and 3': 2000}
@@ -1115,8 +1171,30 @@ def run_self_tests():
     assert round(loan35.accrued_interest, 2) == expected_simple_int
     print("  -> Passed!")
 
+    # Test 36: Multi-Period Forward Cash-Flow Protection (Buffer Preservation)
+    print("Test 36: Multi-Period Forward Cash-Flow Protection (Buffer Preservation)...")
+    opt36 = DebtOptimizer(
+        {'Start Date': datetime.date(2026, 12, 18), 'End Date': datetime.date(2027, 1, 15), 'Initial Checking Balance': 300.0, 'Checking Buffer': 300.0},
+        [{'Card': 'HighAPRCard', 'Issuer': 'Chase', 'APR': 0.25, 'Balance': 5000.0, 'Promo Balance': 0.0, 'Promo End Date': None, 'Statement Cycle End Day': 20, 'Statement Balance': 500.0, 'Grace Active': False, 'Due Day': 15, 'Grace Period Days': 25, 'Cycle End Nth Weekday': 0, 'Min Floor': 40.0, 'Annual Fee': 0.0, 'Renewal Date': None}],
+        [
+            {'Name': 'Loan1', 'Amount Left': 10000.0, 'APR': 0.08, 'Minimum Payment': 400.0, 'Due Day': 5},
+            {'Name': 'Loan2', 'Amount Left': 8000.0, 'APR': 0.07, 'Minimum Payment': 300.0, 'Due Day': 5},
+        ],
+        [{'Name': 'Rent', 'Amount': 1500.0, 'Due Day': 1}],
+        {'Start Date': datetime.date(2026, 12, 18), 'Paycheck 2': 2000.0, 'Paychecks 1 and 3': 2000.0}
+    )
+    schedule36 = opt36.run()
+    # On Dec 18, paycheck brings checking to 2300.
+    # Future deficit in Jan (Rent 1500 + Loans 700 = 2200 vs 2000 paycheck) requires 200 reserve.
+    # Safe extra payment is 1800 (not 2000), leaving checking at 300 on Jan 5 without dipping below buffer.
+    jan5_transactions = [t for t in schedule36 if t['Date'] == '2027-01-05']
+    assert len(jan5_transactions) == 2, "Expected both loan payments on Jan 5"
+    assert jan5_transactions[-1]['Checking Balance'] == 300.0, f"Expected checking balance == 300.0 on Jan 5, got {jan5_transactions[-1]['Checking Balance']}"
+    assert all(t['Checking Balance'] >= 300.0 for t in schedule36), "Checking balance must never dip below buffer"
+    print("  -> Passed!")
+
     print("\n======================================================================")
-    print("ALL 35 MATHEMATICAL TESTS PASSED PERFECTLY!")
+    print("ALL 36 MATHEMATICAL TESTS PASSED PERFECTLY!")
     print("======================================================================\n")
 
 
