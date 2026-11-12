@@ -1,0 +1,15 @@
+services:
+  debt-optimizer:
+    build: .
+    container_name: debt-optimizer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - PYTHONUNBUFFERED=1
+      - PORT=8080
+      - SHEET_NAME=Bank Balance Script 2
+    volumes:
+      # Mount Google Sheets OAuth credentials and token
+      - ./credentials.json:/app/credentials.json:ro
+      - ./token.json:/app/token.json:rw
