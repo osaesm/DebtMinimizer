@@ -290,7 +290,7 @@ class DebtOptimizer:
                 m, y = 12, y - 1
             count = 0
             d = datetime.date(y, m, 1)
-            while True:
+            while count < 24:
                 if d.month != m:
                     raise ValueError(
                         f"Citibank Cycle End Nth Weekday ({citi_weekday}) exceeds the number "
@@ -303,8 +303,10 @@ class DebtOptimizer:
                 d += timedelta(days=1)
         else:
             # Amex, Capital One, Discover, X1
-            return due_date - timedelta(days=grace_days)
-
+            d = due_date - timedelta(days=grace_days)
+            if issuer == 'X1' and d.weekday == 5:
+                return d - timedelta(days=1)
+            return d
     @staticmethod
     def calc_cc_min_payment(issuer: str, statement_balance: float, min_floor: float, 
                             interest_charged: float = 0.0, fees: float = 0.0) -> float:
