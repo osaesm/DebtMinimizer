@@ -265,12 +265,7 @@ class DebtOptimizer:
 
     def get_paycheck_amount(self, pay_date: datetime.date) -> float:
         """Determines paycheck amount in O(1) time based on calendar day."""
-        if pay_date.day <= 14:
-            return self.income.paychecks_1_and_3
-        elif pay_date.day <= 28:
-            return self.income.paycheck_2
-        else:
-            return self.income.paychecks_1_and_3
+    return self.income.paycheck_2 if 15 <= pay_date.day <= 28 else self.income.paychecks_1_and_3
 
     # TODO: X1 calculates cycle end date using 'grace_days', but with a rollback to Friday if the calculated cycle end date is a Saturday.
     @staticmethod
@@ -648,19 +643,7 @@ class DebtOptimizer:
                             cc.grace_active = False
                             cc.consecutive_full_payments = 0
                             # Retroactive interest applied to CC balance (NOT checking account)
-                            if cc.issuer == 'Chase':
-                                prev_cycle_end = self.calculate_cycle_end_date(
-                                    cc.issuer, cc.next_due, cc.grace_period_days,
-                                    cc.cycle_end_nth_weekday, cc.statement_cycle_end_day
-                                )
-                                penalty_days = max(1, (cc.next_due - prev_cycle_end).days)
-                            elif cc.issuer == 'Citibank':
-                                prev_cycle_end = self.calculate_cycle_end_date(
-                                    cc.issuer, cc.next_due, cc.grace_period_days,
-                                    cc.cycle_end_nth_weekday, cc.statement_cycle_end_day
-                                )
-                                penalty_days = max(1, (cc.next_due - prev_cycle_end).days)
-                            elif cc.grace_period_days > 0:
+                            if cc.grace_period_days > 0:
                                 penalty_days = cc.grace_period_days
                             else:
                                 prev_cycle_end = self.calculate_cycle_end_date(
