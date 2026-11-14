@@ -317,22 +317,20 @@ class DebtOptimizer:
         principal = max(0.0, statement_balance - interest_charged - fees)
         
         if issuer == 'American Express':
-            # TODO: Amex truncates the minimum payment after 2 decimal places
-            # max(Min Floor, Interest + Fees + 1% of Principal, 2% of Principal)
-            calc_amt = max(min_floor, interest_charged + fees + (0.01 * principal), 0.02 * principal)
+            # trunc(max(Min Floor, Interest + Fees + 1% of Principal, 2% of Principal), 2)
+            calc_amt = 100*int(max(min_floor, interest_charged + fees + (0.01 * principal), 0.02 * principal)) / 100
         elif issuer == 'Discover':
-            # TODO: Discover rounds to the nearest dollar
-            # max(Min Floor, 20 + Interest + Fees, 2% of statement balance)
-            calc_amt = max(min_floor, 20.0 + interest_charged + fees, 0.02 * statement_balance)
-        else:
-            """
-            TODO:
-            - Issuers round to nearest dollar at different times:
-            - Capital One: calc_amt = interest_charged + fees + round(max(min_floor, 0.01 * principal))
-            - Citibank: calc_amt = round(interest_charged + fees + round(max(min_floor, 0.01 * principal)))
-            """
-            # Capital One, Chase, Citibank, X1: Interest + Fees + max(Min Floor, 1% of Principal)
+            # Round(max(Min Floor, 20 + Interest + Fees, 2% of statement balance))
+            calc_amt = int(round(max(min_floor, 20.0 + interest_charged + fees, 0.02 * statement_balance)))
+        elif issuer == 'Capital One':
+            # Capital One: Interest + Fees + Round(max(Min Floor, 1% of Principal))
+            calc_amt = interest_charged + fees + round(max(min_floor, 0.01 * principal))
+        elif issuer == 'Chase':
+            # Chase: Round(Interest + Fees + max(Min Floor, 1% of Principal), 2)
             calc_amt = interest_charged + fees + max(min_floor, 0.01 * principal)
+        else:
+            # Citibank, X1: Round(Interest + Fees + max(Min Floor, 1% of Principal))
+            calc_amt = round(interest_charged + fees + max(min_floor, 0.01 * principal))
 
         return min(statement_balance, round(calc_amt, 2))
 
