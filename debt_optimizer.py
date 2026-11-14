@@ -272,6 +272,7 @@ class DebtOptimizer:
         else:
             return self.income.paychecks_1_and_3
 
+    # TODO: X1 calculates cycle end date using 'grace_days', but with a rollback to Friday if the calculated cycle end date is a Saturday.
     @staticmethod
     def calculate_cycle_end_date(issuer: str, due_date: datetime.date, 
                                  grace_days: int, citi_weekday: int, chase_day: int) -> datetime.date:
@@ -321,15 +322,23 @@ class DebtOptimizer:
         principal = max(0.0, statement_balance - interest_charged - fees)
         
         if issuer == 'American Express':
+            # TODO: Amex truncates the minimum payment after 2 decimal places
             # max(Min Floor, Interest + Fees + 1% of Principal, 2% of Principal)
             calc_amt = max(min_floor, interest_charged + fees + (0.01 * principal), 0.02 * principal)
         elif issuer == 'Discover':
+            # TODO: Discover rounds to the nearest dollar
             # max(Min Floor, 20 + Interest + Fees, 2% of statement balance)
             calc_amt = max(min_floor, 20.0 + interest_charged + fees, 0.02 * statement_balance)
         else:
+            """
+            TODO:
+            - Issuers round to nearest dollar at different times:
+            - Capital One: calc_amt = interest_charged + fees + round(max(min_floor, 0.01 * principal))
+            - Citibank: calc_amt = round(interest_charged + fees + round(max(min_floor, 0.01 * principal)))
+            """
             # Capital One, Chase, Citibank, X1: Interest + Fees + max(Min Floor, 1% of Principal)
             calc_amt = interest_charged + fees + max(min_floor, 0.01 * principal)
-            
+
         return min(statement_balance, round(calc_amt, 2))
 
     def log_transaction(self, description: str, amount: float):
