@@ -104,10 +104,14 @@ def run_self_tests():
     )
     log9 = opt9.run()
     # On Jan 7: Paycheck arrives. Rent was paid on Jan 1. Checking = 3000.
-    # Mandatory future before next payday (Jan 21) = 40 (Amex min) + 300 (Loan) + 40 (Chase min) = 380.
-    # Disposable = 3000 - 500 (buffer) - 380 = 2120.
+    # Initial lookahead holds 380 (Amex 40 + Loan 300 + Chase 40), paying 2120 to Chase.
+    # By Rule 9, the early payment satisfies Chase's 40 min due, unlocking that 40 on the same day.
+    # Same-day consolidation (Option A) combines both payments into one on Jan 7: Chase total extra = 2160.0.
     chase_extra = [t for t in log9 if t['Date'] == '2026-01-07' and 'Extra payment to Chase' in t['Description']]
-    assert len(chase_extra) == 1 and abs(chase_extra[0]['Amount']) == 2120.0
+    assert len(chase_extra) == 1 and abs(chase_extra[0]['Amount']) == 2160.0
+    # On Jan 8, no redundant second payment is made
+    chase_extra_jan8 = [t for t in log9 if t['Date'] == '2026-01-08']
+    assert len(chase_extra_jan8) == 0
     print("  -> Passed!")
 
     # ------------------------------------------------------------------
@@ -153,7 +157,10 @@ def run_self_tests():
     assert DebtOptimizer.calculate_cycle_end_date('American Express', due_apr, 25, 0, 0) == datetime.date(2026, 3, 14)
     assert DebtOptimizer.calculate_cycle_end_date('Capital One', due_apr, 25, 0, 0) == datetime.date(2026, 3, 14)
     assert DebtOptimizer.calculate_cycle_end_date('Discover', due_apr, 25, 0, 0) == datetime.date(2026, 3, 14)
-    assert DebtOptimizer.calculate_cycle_end_date('X1', due_apr, 25, 0, 0) == datetime.date(2026, 3, 14)
+    # X1 uses 23 days with Friday rollback if calculated date lands on Saturday
+    assert DebtOptimizer.calculate_cycle_end_date('X1', due_apr, 23, 0, 0) == datetime.date(2026, 3, 16)
+    due_sat = datetime.date(2026, 4, 13)  # 4/13 - 23 days = 3/21 (Saturday) -> rolls back to Friday 3/20
+    assert DebtOptimizer.calculate_cycle_end_date('X1', due_sat, 23, 0, 0) == datetime.date(2026, 3, 20)
     print("  -> Passed!")
 
     # Test 16: New 7 - Citibank Cycle End Date Across Year Boundary (Dec/Jan)

@@ -84,7 +84,8 @@ For each calendar day from `Start Date` to `End Date`:
 | :--- | :--- | :--- |
 | **Chase** | Fixed day of month, decoupled from due date. If `chase_day < due_day` and `(due_day - chase_day) >= 15`, cycle end is in the same month; otherwise prior month. | `Statement Cycle End Day` |
 | **Citibank** | Nth business day (Monday=0 to Friday=4) of the month prior to due date. Loop guard raises `ValueError` if N exceeds month's business days. | `Cycle End Nth Weekday` |
-| **Amex, CapOne, Discover, X1** | Exact calendar offset: `due_date - timedelta(days=grace_period_days)`. | `Grace Period Days` |
+| **Amex, CapOne, Discover** | Exact calendar offset: `due_date - timedelta(days=grace_period_days)`. | `Grace Period Days` |
+| **X1** | Exact calendar offset using `grace_period_days` (typically 23 days), with a rollback to Friday if the calculated cycle end date lands on a Saturday: `due_date - timedelta(days=grace_period_days)` (rolled back 1 day if Saturday). | `Grace Period Days` (typically 23) |
 
 ---
 
@@ -166,7 +167,7 @@ When disposable cash is available:
 | `Statement Balance` | Currency / Float | Last closed statement balance. |
 | `Grace Active` | Boolean (`TRUE`/`FALSE`) | `TRUE` if grace is currently intact. |
 | `Due Day` | Integer (1–31) | Day of month payment is due. |
-| `Grace Period Days` | Integer | Days between cycle end and due date (**Required for Amex, CapOne, Discover, X1**). |
+| `Grace Period Days` | Integer | Days between cycle end and due date (**Required for Amex, CapOne, Discover, X1**; X1 uses 23 with Saturday-to-Friday rollback). |
 | `Cycle End Nth Weekday` | Integer (1–5) | Nth business day of prior month (**Required for Citibank**). |
 | `Min Floor` | Currency / Float | Absolute minimum floor (e.g., `$25.00`, `$35.00`, or `$40.00`). |
 | `Annual Fee` | Currency / Float | Card annual fee (e.g., `$95.00`, `$695.00`). |

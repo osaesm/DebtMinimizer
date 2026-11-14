@@ -276,7 +276,7 @@ class DebtOptimizer:
         """Determines paycheck amount in O(1) time based on calendar day."""
         return self.income.paycheck_2 if 15 <= pay_date.day <= 28 else self.income.paychecks_1_and_3
 
-    # TODO: X1 calculates cycle end date using 'grace_days', but with a rollback to Friday if the calculated cycle end date is a Saturday.
+    # X1 calculates cycle end date using 'grace_days' (typically 23), with a rollback to Friday if the calculated cycle end date is a Saturday.
     @staticmethod
     def calculate_cycle_end_date(issuer: str, due_date: datetime.date,
                                  grace_days: int, citi_weekday: int, chase_day: int) -> datetime.date:
@@ -310,10 +310,14 @@ class DebtOptimizer:
                     if count == citi_weekday:
                         return d
                 d += timedelta(days=1)
+            raise ValueError(
+                f"Citibank Cycle End Nth Weekday ({citi_weekday}) exceeds the number "
+                f"of business days in {y}-{m:02d}."
+            )
         else:
             # Amex, Capital One, Discover, X1
             d = due_date - timedelta(days=grace_days)
-            if issuer == 'X1' and d.weekday == 5:
+            if issuer == 'X1' and d.weekday() == 5:
                 return d - timedelta(days=1)
             return d
 
@@ -330,8 +334,8 @@ class DebtOptimizer:
 
         if issuer == 'American Express':
             # trunc(max(Min Floor, Interest + Fees + 1% of Principal, 2% of Principal), 2)
-            calc_amt = 100*int(max(min_floor, interest_charged +
-                               fees + (0.01 * principal), 0.02 * principal)) / 100
+            calc_amt = int(100*max(min_floor, interest_charged +
+                                   fees + (0.01 * principal), 0.02 * principal)) / 100
         elif issuer == 'Discover':
             # Round(max(Min Floor, 20 + Interest + Fees, 2% of statement balance))
             calc_amt = int(
@@ -513,10 +517,11 @@ class DebtOptimizer:
             # -------------------------------------------------------------
             # Run extra payment optimizer when checking balance exceeds buffer
             if self.checking > self.buffer:
-                disposable = self.calculate_disposable_cash()
+                while True:
+                    disposable = self.calculate_disposable_cash()
+                    if disposable <= 0.01:
+                        break
 
-                # Waterfall extra payments to highest APR interest-bearing debt
-                while disposable > 0.01:
                     candidates = []
                     for cc in self.ccs:
                         # Extra payments only target interest-bearing balance
@@ -537,11 +542,12 @@ class DebtOptimizer:
                         round(self.checking - self.buffer, 4) * 100.0) / 100.0)
                     if max_extra <= 0.005:
                         break
-                    disposable = min(disposable, max_extra)
+                    pay_amt = min(disposable, max_extra)
 
                     if target_type == 'cc':
-                        pay_amt = min(disposable, target.balance)
-                        pay_amt = min(pay_amt, max_extra)
+                        pay_amt = min(pay_amt, target.balance)
+                        if pay_amt <= 0.005:
+                            break
                         target.balance -= pay_amt
                         if target.balance < 0.005:
                             target.balance = 0.0
@@ -549,13 +555,12 @@ class DebtOptimizer:
                         target.remaining_min_due = max(
                             0.0, target.remaining_min_due - pay_amt)
                         target.amount_paid_this_cycle += pay_amt
-                        self.log_transaction(
-                            f"Extra payment to {target.card}", -pay_amt)
-                        disposable -= pay_amt
+                        desc = f"Extra payment to {target.card}"
                     else:
                         total_loan_owed = target.amount_left + target.accrued_interest
-                        pay_amt = min(disposable, total_loan_owed)
-                        pay_amt = min(pay_amt, max_extra)
+                        pay_amt = min(pay_amt, total_loan_owed)
+                        if pay_amt <= 0.005:
+                            break
                         # Simple interest: pay accrued interest first, then reduce principal
                         int_pay = min(pay_amt, target.accrued_interest)
                         target.accrued_interest -= int_pay
@@ -569,9 +574,19 @@ class DebtOptimizer:
                         target.remaining_min_due = max(
                             0.0, target.remaining_min_due - pay_amt)
                         target.amount_paid_this_cycle += pay_amt
-                        self.log_transaction(
-                            f"Extra payment to {target.name}", -pay_amt)
-                        disposable -= pay_amt
+                        desc = f"Extra payment to {target.name}"
+
+                    # Consolidate into existing same-day transaction for this debt if present
+                    date_str = self.current_date.strftime('%Y-%m-%d')
+                    if self.schedule_log and self.schedule_log[-1]['Date'] == date_str and self.schedule_log[-1]['Description'] == desc:
+                        amt = round(-pay_amt, 2)
+                        self.checking = round(self.checking + amt, 2)
+                        if abs(self.checking - self.buffer) < 0.005:
+                            self.checking = round(self.buffer, 2)
+                        self.schedule_log[-1]['Amount'] = round(self.schedule_log[-1]['Amount'] + amt, 2)
+                        self.schedule_log[-1]['Checking Balance'] = self.checking
+                    else:
+                        self.log_transaction(desc, -pay_amt)
 
             # -------------------------------------------------------------
             # 5. Process Mandatory Payments Due Today
@@ -682,6 +697,11 @@ class DebtOptimizer:
                             # Retroactive interest applied to CC balance (NOT checking account)
                             if cc.grace_period_days > 0:
                                 penalty_days = cc.grace_period_days
+                                if cc.issuer == 'X1':
+                                    prev_cycle_end = self.calculate_cycle_end_date(
+                                        cc.issuer, cc.next_due, cc.grace_period_days, cc.cycle_end_nth_weekday, cc.statement_cycle_end_day)
+                                    penalty_days = max(
+                                        1, (cc.next_due - prev_cycle_end).days)
                             else:
                                 prev_cycle_end = self.calculate_cycle_end_date(
                                     cc.issuer, cc.next_due, cc.grace_period_days,
