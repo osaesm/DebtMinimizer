@@ -6,7 +6,7 @@ from debt_optimizer import DebtOptimizer, advance_month, make_date, clamp_day, g
 
 def run_self_tests():
     print("======================================================================")
-    print("Running Full Suite of Mathematical Tests (38 Comprehensive Scenarios)")
+    print("Running Full Suite of Mathematical Tests (39 Comprehensive Scenarios)")
     print("======================================================================")
 
     base_income = {'Start Date': datetime.date(2026, 1, 1), 'Paycheck 2': 2200, 'Paychecks 1 and 3': 2000}
@@ -106,7 +106,7 @@ def run_self_tests():
     # On Jan 7: Paycheck arrives. Rent was paid on Jan 1. Checking = 3000.
     # Initial lookahead holds 380 (Amex 40 + Loan 300 + Chase 40), paying 2120 to Chase.
     # By Rule 9, the early payment satisfies Chase's 40 min due, unlocking that 40 on the same day.
-    # Same-day consolidation (Option A) combines both payments into one on Jan 7: Chase total extra = 2160.0.
+    # Same-day consolidation combines intra-day re-evaluated payments into one transaction on Jan 7: Chase total extra = 2160.0.
     chase_extra = [t for t in log9 if t['Date'] == '2026-01-07' and 'Extra payment to Chase' in t['Description']]
     assert len(chase_extra) == 1 and abs(chase_extra[0]['Amount']) == 2160.0
     # On Jan 8, no redundant second payment is made
@@ -192,12 +192,13 @@ def run_self_tests():
 
     # Test 18b: Start after renewal date in year 1, fee triggers on renewal date in year 2
     opt18b = DebtOptimizer(
-        {'Start Date': datetime.date(2026, 6, 1), 'End Date': datetime.date(2027, 6, 1), 'Initial Checking Balance': 0, 'Checking Buffer': 0},
+        {'Start Date': datetime.date(2026, 6, 1), 'End Date': datetime.date(2027, 4, 20), 'Initial Checking Balance': 0, 'Checking Buffer': 0},
         [{'Card': 'FeeCard', 'Issuer': 'American Express', 'APR': 0.0, 'Balance': 500, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 25, 'Statement Balance': 0, 'Min Floor': 0, 'Grace Period Days': 25, 'Annual Fee': 95.0, 'Renewal Date': datetime.date(2026, 4, 15)}],
         [], [], {'Start Date': datetime.date(2026, 6, 1), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
     )
     opt18b.run()
-    assert opt18b.ccs[0].balance == 595.0
+    total_paid_18b = sum(abs(t['Amount']) for t in opt18b.schedule_log if 'Payment to FeeCard' in t['Description'])
+    assert round(opt18b.ccs[0].balance + total_paid_18b, 2) == 595.0
 
     # Test 18c: Multi-year simulation triggers annual fee once per calendar year
     opt18c = DebtOptimizer(
@@ -206,7 +207,8 @@ def run_self_tests():
         [], [], {'Start Date': datetime.date(2026, 1, 1), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
     )
     opt18c.run()
-    assert opt18c.ccs[0].balance == 690.0  # Charged on 2026-04-15 and 2027-04-15
+    total_paid_18c = sum(abs(t['Amount']) for t in opt18c.schedule_log if 'Payment to FeeCard' in t['Description'])
+    assert round(opt18c.ccs[0].balance + total_paid_18c, 2) == 690.0
     print("  -> Passed!")
 
     # Test 19: New 10 - Grace Period Preservation with Sufficient Cash (Rule 4)
@@ -574,8 +576,24 @@ def run_self_tests():
     assert len(vx_pmts) == 1, "VentureX payment must NOT be skipped in January"
     print("  -> Passed!")
 
+    # Test 39: Priority Hierarchy: Unconditional Debt Minimums (Priority 2 > Priority 3)
+    print("Test 39: Unconditional Debt Minimums Driving Checking Negative (Priority 2 > Priority 3)...")
+    opt39 = DebtOptimizer(
+        {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 1, 5), 'Initial Checking Balance': 50.0, 'Checking Buffer': 100.0},
+        [{'Card': 'Card1', 'Issuer': 'Chase', 'APR': 0.20, 'Balance': 1000.0, 'Promo Balance': 0.0, 'Promo End Date': None, 'Statement Cycle End Day': 25, 'Statement Balance': 1000.0, 'Grace Active': False, 'Due Day': 3, 'Grace Period Days': 25, 'Cycle End Nth Weekday': 0, 'Min Floor': 50.0, 'Annual Fee': 0.0, 'Renewal Date': None}],
+        [{'Name': 'Loan1', 'Amount Left': 5000.0, 'APR': 0.10, 'Minimum Payment': 200.0, 'Due Day': 2}],
+        [], {'Start Date': datetime.date(2026, 1, 15), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+    )
+    log39 = opt39.run()
+    assert opt39.checking == -200.0, f"Expected checking to be -200.0, got {opt39.checking}"
+    loan_pmt = [t for t in log39 if 'Loan Payment' in t['Description']]
+    card_pmt = [t for t in log39 if 'Payment to Card1' in t['Description']]
+    assert len(loan_pmt) == 1 and abs(loan_pmt[0]['Amount']) == 200.0
+    assert len(card_pmt) == 1 and abs(card_pmt[0]['Amount']) == 50.0
+    print("  -> Passed!")
+
     print("\n======================================================================")
-    print("ALL 38 MATHEMATICAL TESTS PASSED PERFECTLY!")
+    print("ALL 39 MATHEMATICAL TESTS PASSED PERFECTLY!")
     print("======================================================================\n")
 
 

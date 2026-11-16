@@ -122,6 +122,24 @@ class IncomeSchedule:
 # =====================================================================
 
 class DebtOptimizer:
+    """
+    Deterministic day-by-day personal finance simulation and debt avalanche optimization engine.
+
+    Cash Flow Priority Hierarchy (Strict Order from Highest to Lowest):
+      1. Pay Monthly Payments: Recurring non-debt fixed living expenses (Rent, Utilities, Insurance)
+         are executed unconditionally on their due dates.
+      2. Pay Minimum Payments on Loans & Credit Cards: Mandatory debt obligations are executed
+         unconditionally on their due dates to prevent default and penalties, even if checking
+         cash is depleted (driving the balance negative).
+      3. Positive Checking Balance: Checking is strictly protected against discretionary outflows;
+         only unavoidable mandatory obligations (Priority 1 & Priority 2) may push checking negative.
+      4. Checking Balance Above Buffer: The designated safety cash floor (Checking Buffer) is
+         protected by multi-period forward lookahead simulation. Elective full statement payments
+         (to maintain grace) and extra avalanche payments are made only if the lookahead cushion
+         guarantees the buffer is never breached at any future date.
+      5. Extra Payments (Debt Avalanche): Discretionary surplus cash confirmed safe by the forward
+         lookahead engine is waterfalled to active interest-bearing debts, strictly descending by APR.
+    """
     def __init__(self, params: Dict[str, Any], ccs: List[Dict[str, Any]],
                  loans: List[Dict[str, Any]], monthly: List[Dict[str, Any]],
                  income: Dict[str, Any]):
@@ -626,8 +644,8 @@ class DebtOptimizer:
                     # Due is remaining minimum or remaining balance (Rule 10)
                     total_loan_owed = loan.amount_left + loan.accrued_interest
                     due_amt = min(total_loan_owed, loan.remaining_min_due)
-                    # Cap at checking if deficit
-                    pay_amt = min(due_amt, self.checking)
+                    # Priority 2 > Priority 3: Pay minimum payment unconditionally
+                    pay_amt = due_amt
                     if pay_amt > 0:
                         # Simple interest: pay accrued interest first, then reduce principal
                         int_pay = min(pay_amt, loan.accrued_interest)
@@ -673,14 +691,13 @@ class DebtOptimizer:
                         min_margin = self.get_projected_min_margin()
                         # Safe payment taking multi-period forward lookahead cushion into account
                         safe_target = round(target_pay + min_margin, 2)
-                        # Rule 4 & 11: Pay full statement balance if cash allows; else pay down to buffer,
-                        # but always at least minimum payment (dipping into buffer if necessary)
+                        # Priority 4 > Priority 5: Pay full statement balance if cash allows (down to buffer);
+                        # Priority 2 > Priority 3: Otherwise, pay at least minimum payment unconditionally
                         pay_amt = max(cc.remaining_min_due, min(
                             target_pay, safe_target))
-                        # Buffer dip / cap at checking
-                        pay_amt = min(pay_amt, max(0.0, self.checking))
                     else:
-                        pay_amt = min(cc.remaining_min_due, max(0.0, self.checking))
+                        # Priority 2 > Priority 3: Pay minimum payment unconditionally
+                        pay_amt = cc.remaining_min_due
 
                     # Fix F: Cap payment at total remaining card balance
                     pay_amt = min(pay_amt, total_owed)
@@ -1097,8 +1114,89 @@ def run_optimizer_from_sheet(sheet_name: str, creds_path: str, token_path: str, 
             optimizer.total_interest_paid, 2)])
 
     output_ws.update(rows)
+    apply_output_formatting(sheet, output_ws, len(rows), buf)
     print(
         f"Success! Payment schedule and total interest paid (${round(optimizer.total_interest_paid, 2):,.2f}) written to Google Sheet.")
+
+
+def apply_output_formatting(sheet, output_ws, num_rows: int, buffer_val: float):
+    """
+    Applies conditional formatting to Column D ('Checking Balance') in Output worksheet:
+    1. Deep Red with white bold text for negative checking balance (< 0).
+    2. Light Red with dark red text for checking balance below buffer (0 <= balance < buffer).
+    """
+    try:
+        meta = sheet.fetch_sheet_metadata({'includeGridData': False})
+        existing_rules_count = 0
+        for s in meta.get('sheets', []):
+            if s.get('properties', {}).get('sheetId') == output_ws.id:
+                existing_rules_count = len(s.get('conditionalFormats', []))
+                break
+
+        requests = []
+        for _ in range(existing_rules_count):
+            requests.append({
+                "deleteConditionalFormatRule": {
+                    "sheetId": output_ws.id,
+                    "index": 0
+                }
+            })
+
+        if buffer_val > 0:
+            requests.append({
+                "addConditionalFormatRule": {
+                    "rule": {
+                        "ranges": [{
+                            "sheetId": output_ws.id,
+                            "startRowIndex": 1,
+                            "endRowIndex": num_rows,
+                            "startColumnIndex": 3,
+                            "endColumnIndex": 4
+                        }],
+                        "booleanRule": {
+                            "condition": {
+                                "type": "NUMBER_LESS",
+                                "values": [{"userEnteredValue": str(buffer_val)}]
+                            },
+                            "format": {
+                                "backgroundColor": {"red": 1.0, "green": 0.85, "blue": 0.85},  # Light Red
+                                "textFormat": {"foregroundColor": {"red": 0.6, "green": 0.0, "blue": 0.0}, "bold": True}
+                            }
+                        }
+                    },
+                    "index": 0
+                }
+            })
+
+        requests.append({
+            "addConditionalFormatRule": {
+                "rule": {
+                    "ranges": [{
+                        "sheetId": output_ws.id,
+                        "startRowIndex": 1,
+                        "endRowIndex": num_rows,
+                        "startColumnIndex": 3,
+                        "endColumnIndex": 4
+                    }],
+                    "booleanRule": {
+                        "condition": {
+                            "type": "NUMBER_LESS",
+                            "values": [{"userEnteredValue": "0"}]
+                        },
+                        "format": {
+                            "backgroundColor": {"red": 0.85, "green": 0.25, "blue": 0.25},  # Deep Red
+                            "textFormat": {"foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}, "bold": True}
+                        }
+                    }
+                },
+                "index": 0
+            }
+        })
+
+        if requests:
+            sheet.batch_update({"requests": requests})
+    except Exception as e:
+        print(f"Note: Could not apply conditional formatting to 'Output' sheet: {e}")
 
 
 # =====================================================================

@@ -59,6 +59,16 @@ flowchart TD
     MinBal -- Yes --> Extra["Pay min(disposable, debt_bal) to Highest APR Debt"]
 ```
 
+### 4. Cash Flow Priority Hierarchy (Highest to Lowest)
+
+All financial cash flows in the simulation strictly observe a 5-tier priority hierarchy:
+
+1. **Priority 1: Pay Monthly Payments (Fixed Living Expenses)**: Recurring non-debt fixed living expenses (`MonthlyPayment`: Rent, Utilities, Insurance) are paid unconditionally on their due dates.
+2. **Priority 2: Pay Minimum Payments on Loans & Credit Cards**: Mandatory debt minimum payments are executed unconditionally on their due dates to prevent default, penalties, and credit damage, even if cash is depleted.
+3. **Priority 3: Maintain Positive Checking Balance**: Protected against discretionary outflows; only mandatory Priority 1 & 2 commitments may drive checking negative (flagged in Deep Red).
+4. **Priority 4: Maintain Checking Balance Above Buffer**: The safety cash floor (`Checking Buffer`) is protected by multi-period forward lookahead simulation. Full statement payments (to maintain credit card grace) and extra avalanche payments are made only if the forward lookahead cushion guarantees the buffer is never breached. Clustered mandatory bills dipping below buffer (while $\ge 0$) are flagged in Light Red.
+5. **Priority 5: Allocate Extra Payments to Minimize Lifetime Interest (Debt Avalanche)**: Surplus cash confirmed safe by the forward lookahead engine is waterfalled to active interest-bearing debts, strictly descending by APR.
+
 ---
 
 ## Setup & Installation
@@ -108,14 +118,17 @@ Create a Google Spreadsheet named `Debt Optimization Sheet` (or pass a custom na
 | Tab | Required Column Headers | Description |
 | :--- | :--- | :--- |
 | **`Parameters`** | `Start Date`, `End Date`, `Initial Checking Balance`, `Checking Buffer` | Simulation date range and cash floor. |
-| **`CreditCards`** | `Card`, `Issuer`, `APR`, `Balance`, `Promo Balance`, `Promo End Date`, `Statement Cycle End Day`, `Statement Balance`, `Grace Active`, `Due Day`, `Grace Period Days`, `Cycle End Nth Weekday`, `Min Floor`, `Annual Fee`, `Renewal Date` | Supports Chase, Citibank, Amex, Capital One, Discover, and X1 rules. |
+| **`CreditCards`** | `Card`, `Issuer`, `APR`, `Balance`, `Promo Balance`, `Promo End Date`, `Statement Cycle End Day`, `Statement Balance`, `Grace Active`, `Due Day`, `Grace Period Days`, `Cycle End Nth Weekday`, `Min Floor`, `Annual Fee`, `Renewal Date`, `Initial Minimum Payment` (Optional) | Supports Chase, Citibank, Amex, Capital One, Discover, and X1 rules. `Initial Minimum Payment` overrides cycle 1 to include billed interest. |
 | **`Loans`** | `Name`, `Amount Left`, `APR`, `Minimum Payment`, `Due Day` | Simple interest installment loans. |
 | **`MonthlyPayments`** | `Name`, `Amount`, `Due Day` | Recurring non-debt bills (rent, utilities, etc.). |
 | **`Income`** | `Start Date`, `Paycheck 2`, `Paychecks 1 and 3` | Biweekly pay schedule (14-day cycle). |
 
 ### Output Tab
 The script generates an **`Output`** worksheet:
-- **Columns A–D**: Full chronological transaction ledger (`Date`, `Description`, `Amount`, `Checking Balance`).
+- **Columns A–D**: Full chronological transaction ledger (`Date`, `Description`, `Amount`, `Checking Balance`), ordered by Date ascending and Amount descending.
+- **Conditional Formatting (Column D)**:
+  - **Deep Red** (`#D94040` / dark red text on bold white): `Checking Balance < 0`.
+  - **Light Red** (`#FFD9D9` / dark red text): `0 <= Checking Balance < Buffer`.
 - **Cell G1**: Label `"Total Interest Paid"`.
 - **Cell G2**: Total dollar amount of interest paid over the entire simulation period.
 
