@@ -8,7 +8,7 @@
 
 - **Simulation Engine (`DebtOptimizer`)**: Simulates daily cash flow, accruals, fees, minimum payments, and debt avalanche allocations.
 - **Lookahead Cushion Engine (`calculate_disposable_cash`)**: Multi-period forward simulation projecting future balances to the simulation end date to protect the checking buffer against clustered future bills.
-- **Offline Test Suite (`run_self_tests`)**: 36 comprehensive mathematical unit and integration tests with zero network or external API dependencies.
+- **Offline Test Suite (`run_self_tests`)**: 38 comprehensive mathematical unit and integration tests with zero network or external API dependencies.
 - **Google Sheets Integration (`gspread`)**: Reads configuration across 5 worksheets and writes an ordered transaction ledger and cumulative interest metric to the `Output` worksheet.
 
 ---
@@ -24,7 +24,7 @@ python test_debt_optimizer.py
 python debt_optimizer.py --test
 ```
 - **Never invoke Google Sheets live sync during test/dev cycles.** It triggers interactive browser OAuth prompts, produces large payload responses, and burns unnecessary agent turns.
-- The standalone test suite in `test_debt_optimizer.py` executes all 36 test scenarios in < 0.5s offline with minimal output tokens.
+- The standalone test suite in `test_debt_optimizer.py` executes all 38 test scenarios in < 0.5s offline with minimal output tokens.
 - Only run live Sheets sync (`python debt_optimizer.py --sheet ...`) when the user explicitly instructs you to sync to their sheet.
 
 ### 2. Surgical File Inspection & Editing (Preserves Context Window)
@@ -48,6 +48,7 @@ Use this map to jump directly to code locations without burning search/grep toke
   - `Tests 1–9`: Baseline issuer formulas and cycle closures
   - `Tests 10–32`: Extended edge cases, month clamping, annual fees, debt avalanche priority
   - `Tests 33–36`: Citibank loop guard, dynamic grace penalty, simple interest loans, multi-period cushion
+  - `Tests 37–38`: Initial minimum payment column support, grace card statement payment with lookahead buffer preservation
 
 ### 4. Concise Communication Style
 - Keep explanations direct, technical, and token-efficient.
@@ -71,7 +72,7 @@ For each calendar day from `Start Date` to `End Date`:
 5. **Mandatory Payments Due Today**:
    - Monthly non-debt bills (`MonthlyPayment`).
    - Loan minimum payments (`Loan`).
-   - Credit Card payments: statement balance if grace is active and cash allows; else at least `remaining_min_due` (dipping into buffer if necessary).
+   - Credit Card payments: statement balance if grace is active and forward lookahead cushion allows (`safe_target = round(target_pay + min_margin, 2)`); else at least `remaining_min_due` (dipping into buffer if necessary).
    - Evaluate grace period status and 2-month restoration streak.
 6. **Statement Cycle End Processing**:
    - If `current_date == next_cycle_end`: compute ADB interest (`adb_reg_acc / days_in_cycle * (apr / 365) * days`), add to card balance, update `statement_balance`, reset cycle accumulators, and advance `cycle_due_date` and `next_cycle_end`.
@@ -172,6 +173,7 @@ When disposable cash is available:
 | `Min Floor` | Currency / Float | Absolute minimum floor (e.g., `$25.00`, `$35.00`, or `$40.00`). |
 | `Annual Fee` | Currency / Float | Card annual fee (e.g., `$95.00`, `$695.00`). |
 | `Renewal Date` | Date / `MM/DD` | Fee posting date (recurring month/day). |
+| `Initial Minimum Payment` | Currency / Float / Null | Optional explicit minimum payment for cycle 1 to include prior statement interest/fees. |
 
 #### 3. `Loans`
 | Column Header | Type | Description |

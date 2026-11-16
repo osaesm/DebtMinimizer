@@ -68,6 +68,7 @@ class CreditCard:
     min_floor: float
     annual_fee: float
     renewal_date: Optional[datetime.date]
+    initial_min_payment: Optional[float] = None
 
     # Internal dynamic simulation state
     next_due: datetime.date = field(
@@ -190,6 +191,13 @@ class DebtOptimizer:
             if isinstance(ren_date, str):
                 ren_date = parse_date(ren_date)
 
+            init_min_raw = c.get('Initial Minimum Payment')
+            if init_min_raw is None or str(init_min_raw).strip() == '':
+                init_min_raw = c.get('First Month Min Payment')
+                if init_min_raw is None or str(init_min_raw).strip() == '':
+                    init_min_raw = c.get('Initial Min Payment')
+            init_min_val = parse_float(init_min_raw) if init_min_raw not in (None, '') else None
+
             cc_obj = CreditCard(
                 card=c['Card'],
                 issuer=c['Issuer'],
@@ -207,7 +215,8 @@ class DebtOptimizer:
                     c.get('Cycle End Nth Weekday', 0) or 0),
                 min_floor=float(c.get('Min Floor', 0.0)),
                 annual_fee=float(c.get('Annual Fee', 0.0) or 0.0),
-                renewal_date=ren_date
+                renewal_date=ren_date,
+                initial_min_payment=init_min_val
             )
 
             # 1. Determine next upcoming due date >= start_date
@@ -255,9 +264,13 @@ class DebtOptimizer:
                 cc_obj.adb_reg_acc = cc_obj.balance * cc_obj.days_in_cycle
 
             # 5. Calculate initial minimum payment from starting statement balance
-            cc_obj.remaining_min_due = self.calc_cc_min_payment(
-                cc_obj.issuer, cc_obj.statement_balance, cc_obj.min_floor, 0.0, 0.0
-            )
+            if cc_obj.initial_min_payment is not None and cc_obj.initial_min_payment > 0.0:
+                cc_obj.remaining_min_due = min(
+                    cc_obj.statement_balance, cc_obj.initial_min_payment) if cc_obj.statement_balance > 0 else cc_obj.initial_min_payment
+            else:
+                cc_obj.remaining_min_due = self.calc_cc_min_payment(
+                    cc_obj.issuer, cc_obj.statement_balance, cc_obj.min_floor, 0.0, 0.0
+                )
 
             self.ccs.append(cc_obj)
 
@@ -369,15 +382,11 @@ class DebtOptimizer:
             'Checking Balance': self.checking
         })
 
-    def calculate_disposable_cash(self) -> float:
+    def get_projected_min_margin(self) -> float:
         """
-        Calculates safe disposable cash for extra debt payments.
-        Simulates forward baseline cash flows from current_date to end_date
-        to guarantee checking balance never breaches buffer at any future point.
+        Projects forward baseline cash flows from current_date to end_date
+        and returns the minimum projected liquidity margin (projected_balance - buffer).
         """
-        if self.checking <= self.buffer:
-            return 0.0
-
         proj_bal = self.checking
         min_margin = proj_bal - self.buffer
 
@@ -457,10 +466,23 @@ class DebtOptimizer:
             margin = proj_bal - self.buffer
             if margin < min_margin:
                 min_margin = margin
-                if min_margin <= 0.01:
-                    return 0.0
 
             d += timedelta(days=1)
+
+        return min_margin
+
+    def calculate_disposable_cash(self) -> float:
+        """
+        Calculates safe disposable cash for extra debt payments.
+        Simulates forward baseline cash flows from current_date to end_date
+        to guarantee checking balance never breaches buffer at any future point.
+        """
+        if self.checking <= self.buffer:
+            return 0.0
+
+        min_margin = self.get_projected_min_margin()
+        if min_margin <= 0.01:
+            return 0.0
 
         # Floor to cents so we never overspend by even half a cent into the buffer
         safe_cash = math.floor(round(min_margin, 4) * 100.0) / 100.0
@@ -647,19 +669,22 @@ class DebtOptimizer:
                     if cc.grace_active:
                         target_pay = max(
                             cc.remaining_min_due, cc.statement_balance - cc.amount_paid_this_cycle)
-                        cash_above_buf = max(0.0, math.floor(
-                            round(self.checking - self.buffer, 4) * 100.0) / 100.0)
+                        target_pay = min(target_pay, total_owed)
+                        min_margin = self.get_projected_min_margin()
+                        # Safe payment taking multi-period forward lookahead cushion into account
+                        safe_target = round(target_pay + min_margin, 2)
                         # Rule 4 & 11: Pay full statement balance if cash allows; else pay down to buffer,
                         # but always at least minimum payment (dipping into buffer if necessary)
                         pay_amt = max(cc.remaining_min_due, min(
-                            target_pay, cash_above_buf))
+                            target_pay, safe_target))
                         # Buffer dip / cap at checking
-                        pay_amt = min(pay_amt, self.checking)
+                        pay_amt = min(pay_amt, max(0.0, self.checking))
                     else:
-                        pay_amt = min(cc.remaining_min_due, self.checking)
+                        pay_amt = min(cc.remaining_min_due, max(0.0, self.checking))
 
                     # Fix F: Cap payment at total remaining card balance
                     pay_amt = min(pay_amt, total_owed)
+                    pay_amt = max(0.0, round(pay_amt, 2))
 
                     if pay_amt > 0:
                         # Rule 7: Minimum payment goes to lowest APR first (Promo)
@@ -959,7 +984,10 @@ def run_optimizer_from_sheet(sheet_name: str, creds_path: str, token_path: str, 
             'Cycle End Nth Weekday': int(parse_float(c.get('Cycle End Nth Weekday', 0))),
             'Min Floor': parse_float(c.get('Min Floor', 0)),
             'Annual Fee': parse_float(c.get('Annual Fee', 0)),
-            'Renewal Date': parse_date(c.get('Renewal Date'))
+            'Renewal Date': parse_date(c.get('Renewal Date')),
+            'Initial Minimum Payment': parse_float(c.get('Initial Minimum Payment')) if c.get('Initial Minimum Payment') not in (None, '') else (
+                parse_float(c.get('First Month Min Payment')) if c.get('First Month Min Payment') not in (None, '') else None
+            )
         })
 
     # 3. Loans

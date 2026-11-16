@@ -6,7 +6,7 @@ from debt_optimizer import DebtOptimizer, advance_month, make_date, clamp_day, g
 
 def run_self_tests():
     print("======================================================================")
-    print("Running Full Suite of Mathematical Tests (36 Comprehensive Scenarios)")
+    print("Running Full Suite of Mathematical Tests (38 Comprehensive Scenarios)")
     print("======================================================================")
 
     base_income = {'Start Date': datetime.date(2026, 1, 1), 'Paycheck 2': 2200, 'Paychecks 1 and 3': 2000}
@@ -533,8 +533,49 @@ def run_self_tests():
     assert all(t['Checking Balance'] >= 300.0 for t in schedule36), "Checking balance must never dip below buffer"
     print("  -> Passed!")
 
+    # Test 37: Initial Minimum Payment Column Support (Cycle 1 Billed Interest Override)
+    print("Test 37: Initial Minimum Payment Column Support...")
+    opt37 = DebtOptimizer(
+        {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 1, 10), 'Initial Checking Balance': 200.0, 'Checking Buffer': 200.0},
+        [{
+            'Card': 'CustomMinCard', 'Issuer': 'Chase', 'APR': 0.24, 'Balance': 1000.0,
+            'Promo Balance': 0.0, 'Promo End Date': None, 'Statement Cycle End Day': 25,
+            'Statement Balance': 1000.0, 'Grace Active': False, 'Due Day': 5,
+            'Grace Period Days': 25, 'Cycle End Nth Weekday': 0, 'Min Floor': 40.0,
+            'Annual Fee': 0.0, 'Renewal Date': None, 'Initial Minimum Payment': 85.0
+        }],
+        [], [], {'Start Date': datetime.date(2026, 1, 1), 'Paycheck 2': 0, 'Paychecks 1 and 3': 0}
+    )
+    assert opt37.ccs[0].remaining_min_due == 85.0, "Initial minimum due must honor 'Initial Minimum Payment' column"
+    log37 = opt37.run()
+    jan5_pmt = [t for t in log37 if t['Date'] == '2026-01-05' and 'Payment to CustomMinCard' in t['Description']]
+    assert len(jan5_pmt) == 1 and abs(jan5_pmt[0]['Amount']) == 85.0, f"Expected payment of 85.0, got {jan5_pmt}"
+    print("  -> Passed!")
+
+    # Test 38: Grace Card Statement Payment with Lookahead Buffer Preservation
+    print("Test 38: Grace Card Statement Payment with Lookahead Buffer Preservation...")
+    opt38 = DebtOptimizer(
+        {'Start Date': datetime.date(2026, 12, 21), 'End Date': datetime.date(2027, 1, 5), 'Initial Checking Balance': 888.24, 'Checking Buffer': 200.0},
+        [
+            {'Card': 'GraceCard', 'Issuer': 'Chase', 'APR': 0.20, 'Balance': 688.24, 'Promo Balance': 0.0, 'Promo End Date': None, 'Statement Cycle End Day': 26, 'Statement Balance': 688.24, 'Grace Active': True, 'Due Day': 21, 'Grace Period Days': 25, 'Cycle End Nth Weekday': 0, 'Min Floor': 35.0, 'Annual Fee': 0.0, 'Renewal Date': None},
+            {'Card': 'VentureX', 'Issuer': 'Capital One', 'APR': 0.25, 'Balance': 500.0, 'Promo Balance': 0.0, 'Promo End Date': None, 'Statement Cycle End Day': 8, 'Statement Balance': 500.0, 'Grace Active': False, 'Due Day': 3, 'Grace Period Days': 25, 'Cycle End Nth Weekday': 0, 'Min Floor': 35.0, 'Annual Fee': 0.0, 'Renewal Date': None}
+        ],
+        [],
+        [
+            {'Name': 'Rent', 'Amount': 4087.50, 'Due Day': 1},
+            {'Name': 'Utilities', 'Amount': 250.0, 'Due Day': 1},
+            {'Name': 'Astound', 'Amount': 44.13, 'Due Day': 2}
+        ],
+        {'Start Date': datetime.date(2026, 12, 25), 'Paycheck 2': 4295.41, 'Paychecks 1 and 3': 4295.41}
+    )
+    log38 = opt38.run()
+    assert all(t['Checking Balance'] >= 200.0 - 0.005 for t in log38), f"Checking balance dipped below buffer: {[t for t in log38 if t['Checking Balance'] < 200.0]}"
+    vx_pmts = [t for t in log38 if t['Date'] == '2027-01-03' and 'VentureX' in t['Description']]
+    assert len(vx_pmts) == 1, "VentureX payment must NOT be skipped in January"
+    print("  -> Passed!")
+
     print("\n======================================================================")
-    print("ALL 36 MATHEMATICAL TESTS PASSED PERFECTLY!")
+    print("ALL 38 MATHEMATICAL TESTS PASSED PERFECTLY!")
     print("======================================================================\n")
 
 
