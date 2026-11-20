@@ -8,7 +8,7 @@
 
 - **Simulation Engine (`DebtOptimizer`)**: Simulates daily cash flow, accruals, fees, minimum payments, and debt avalanche allocations.
 - **Lookahead Cushion Engine (`calculate_disposable_cash`)**: Multi-period forward simulation projecting future balances to the simulation end date to protect the checking buffer against clustered future bills.
-- **Offline Test Suite (`run_self_tests`)**: 39 comprehensive mathematical unit and integration tests with zero network or external API dependencies.
+- **Offline Test Suite (`run_self_tests`)**: 41 comprehensive mathematical unit and integration tests with zero network or external API dependencies.
 - **Google Sheets Integration (`gspread`)**: Reads configuration across 5 worksheets and writes an ordered transaction ledger and cumulative interest metric to the `Output` worksheet.
 
 ---
@@ -36,19 +36,20 @@ python debt_optimizer.py --test
 Use this map to jump directly to code locations without burning search/grep tokens:
 - **`debt_optimizer.py`**:
   - `Lines 20–48`: Date utilities (`clamp_day`, `advance_month`, `get_first_due_date`, `make_date`)
-  - `Lines 50–118`: Dataclasses (`CreditCard`, `Loan`, `MonthlyPayment`, `IncomeSchedule`)
-  - `Lines 120–290`: `DebtOptimizer.__init__` (state setup, renewal normalization, cycle date resolution)
-  - `Lines 292–380`: O(1) Income schedules, issuer cycle end logic, credit card minimum payment formulas
-  - `Lines 382–470`: `get_projected_min_margin()`, `calculate_disposable_cash()` (lookahead cushion engine)
-  - `Lines 472–780`: `run()` (daily simulation loop, 6-step order of operations)
-  - `Lines 782–795`: `run_self_tests()` test delegator
-  - `Lines 798–1180`: Google Sheets I/O, parsers, batch Output writer, conditional formatting (`apply_output_formatting`)
-  - `Lines 1182–1255`: CLI argument parsing and entrypoint
+  - `Lines 50–135`: Dataclasses (`CreditCard`, `Loan`, `MonthlyPayment`, `IncomeSchedule`)
+  - `Lines 137–365`: `DebtOptimizer.__init__` (state setup, renewal normalization, cycle date resolution)
+  - `Lines 367–450`: Income schedules, issuer cycle end logic, credit card minimum payment formulas
+  - `Lines 452–594`: `get_projected_min_margin()`, `calculate_disposable_cash()` (lookahead cushion engine)
+  - `Lines 595–897`: `run()` (daily simulation loop, 6-step order of operations)
+  - `Lines 900–908`: `run_self_tests()` test delegator
+  - `Lines 910–1302`: Google Sheets I/O, parsers, batch Output writer, conditional formatting (`apply_output_formatting`)
+  - `Lines 1304–1355`: CLI argument parsing and entrypoint
 - **`test_debt_optimizer.py`**:
   - `Tests 1–9`: Baseline issuer formulas and cycle closures
   - `Tests 10–32`: Extended edge cases, month clamping, annual fees, debt avalanche priority
   - `Tests 33–36`: Citibank loop guard, dynamic grace penalty, simple interest loans, multi-period cushion
-  - `Tests 37–39`: Initial minimum payment column support, grace card statement payment with lookahead buffer preservation, unconditional minimums driving checking negative (Priority 2 > Priority 3)
+  - `Tests 37–39`: Initial minimum payment column support, grace card statement payment with lookahead buffer preservation, unconditional minimums driving checking negative
+  - `Tests 40–41`: Semi-monthly pay schedule (1st and 15th), multiple simultaneous income schedules
 
 ### 4. Concise Communication Style
 - Keep explanations direct, technical, and token-efficient.
@@ -60,7 +61,7 @@ Use this map to jump directly to code locations without burning search/grep toke
 
 ### 1. Cash Flow Priority Hierarchy (Strict Order: Highest to Lowest)
 
-The simulation governs all cash flow movements strictly according to this 5-tier priority hierarchy:
+The simulation governs all cash flow movements strictly according to this 4-tier priority hierarchy:
 
 1. **Priority 1: Pay Monthly Payments (Fixed Living Expenses)**
    - Fixed, non-debt recurring obligations (`MonthlyPayment`: rent, utilities, insurance) are executed unconditionally on their scheduled due dates.
@@ -68,19 +69,14 @@ The simulation governs all cash flow movements strictly according to this 5-tier
 
 2. **Priority 2: Pay Minimum Payments on Loans and Credit Cards**
    - Contractual debt minimum payments (`Loan.minimum_payment` and `CreditCard.remaining_min_due`) are mandatory obligations required to prevent defaults, penalty fees, and credit damage.
-   - Executed unconditionally on their due dates. If available checking cash is insufficient, minimums are paid in full, driving the checking account into a negative balance (overdraft/deficit).
+   - Executed unconditionally on their due dates. If available checking cash is insufficient, minimums are paid in full, driving the checking account into a negative balance (overdraft/deficit, visually flagged in **Deep Red** on the Output sheet).
 
-3. **Priority 3: Maintain Positive Checking Balance**
-   - The checking account balance is strictly protected against all discretionary outflows.
-   - Only unavoidable mandatory obligations (Priority 1 living expenses and Priority 2 debt minimums) are permitted to drive the checking balance negative.
-   - Any negative balance is visually flagged in **Deep Red** on the Output sheet.
-
-4. **Priority 4: Maintain Checking Balance Above Buffer**
-   - The designated safety reserve (`Checking Buffer`) is protected against elective cash allocations.
+3. **Priority 3: Maintain Checking Balance Above Buffer**
+   - The designated safety reserve (`Checking Buffer` $\ge 0$) is protected against elective cash allocations. Because `Checking Buffer` $\ge 0$, this also strictly guarantees the checking account never dips negative for any discretionary outflow.
    - Full statement balance payments on grace-active credit cards (to prevent retroactive interest) and extra avalanche payments are permitted **only** if the multi-period forward lookahead simulation confirms checking never breaches the buffer across the entire horizon through `End Date`.
    - Any dip below buffer (while remaining $\ge 0$) caused by clustered mandatory payments is visually flagged in **Light Red** on the Output sheet.
 
-5. **Priority 5: Allocate Extra Payments to Minimize Lifetime Interest (Debt Avalanche)**
+4. **Priority 4: Allocate Extra Payments to Minimize Lifetime Interest (Debt Avalanche)**
    - Discretionary surplus cash confirmed safe by the forward lookahead cushion engine is waterfalled to active interest-bearing debts, strictly descending by APR.
 
 ---
@@ -88,18 +84,18 @@ The simulation governs all cash flow movements strictly according to this 5-tier
 ### 2. Daily Simulation Order of Operations (`DebtOptimizer.run`)
 For each calendar day from `Start Date` to `End Date`:
 1. **Annual Fees**: Check recurring annual calendar match `(current_date.month == cc.renewal_date.month and current_date.day == clamp_day(current_date.year, cc.renewal_date.month, cc.renewal_date.day))`; if so, posts fee to card balance as a regular purchase (included in principal and statement balance, not treated as an upfront 100% penalty fee). Recurring yearly without date mutation.
-2. **Income Processing**: Check biweekly payday via `is_payday(current_date)`. Credit paycheck (`paycheck_2` if day 15–28, else `paychecks_1_and_3`).
+2. **Income Processing**: Credit paychecks from all active income schedules firing today via `get_total_income(current_date)`.
 3. **Daily Accruals & Expirations**:
    - Loans: `loan.accrued_interest += loan.amount_left * (loan.apr / 365.0)`.
    - Credit Cards: If `current_date > promo_end_date`, shift promo balance to regular balance.
    - Accumulate Average Daily Balance: `adb_reg_acc += balance`, `days_in_cycle += 1`.
-4. **Lookahead Optimizer & Extra Payments (Priority 5)**:
+4. **Lookahead Optimizer & Extra Payments (Priority 4)**:
    - If `checking > buffer`, call `calculate_disposable_cash()`.
    - Waterfall extra payments strictly to highest APR interest-bearing debt (non-grace credit card balance or loan balance).
-5. **Mandatory Payments Due Today (Priorities 1 & 2)**:
+5. **Mandatory Payments Due Today (Priorities 1 & 2, with Grace Statement governed by Priority 3)**:
    - Monthly non-debt bills (`MonthlyPayment`): Paid unconditionally (Priority 1).
-   - Loan minimum payments (`Loan`): Paid unconditionally (Priority 2 > Priority 3), driving checking negative if cash is insufficient.
-   - Credit Card payments: Statement balance if grace is active and forward lookahead cushion allows (`safe_target = round(target_pay + min_margin, 2)`); otherwise mandatory minimum payment is paid unconditionally (Priority 2 > Priority 3).
+   - Loan minimum payments (`Loan`): Paid unconditionally (Priority 2), driving checking negative if cash is insufficient.
+   - Credit Card payments: Statement balance if grace is active and forward lookahead cushion allows (Priority 3: `safe_target = round(target_pay + min_margin, 2)`); otherwise mandatory minimum payment is paid unconditionally (Priority 2).
    - Evaluate grace period status and 2-month restoration streak.
 6. **Statement Cycle End Processing**:
    - If `current_date == next_cycle_end`: compute ADB interest (`adb_reg_acc / days_in_cycle * (apr / 365) * days`), add to card balance, update `statement_balance`, reset cycle accumulators, and advance `cycle_due_date` and `next_cycle_end`.
@@ -219,11 +215,14 @@ When disposable cash is available:
 | `Due Day` | Integer (1–31) | Day of month bill is paid. |
 
 #### 5. `Income`
+Multiple rows supported (each row is an independent income schedule):
 | Column Header | Type | Description |
 | :--- | :--- | :--- |
-| `Start Date` | Date | Reference anchor date for 14-day biweekly pay cycle. |
-| `Paycheck 2` | Currency / Float | Paycheck amount for paydays landing on days 15–28. |
-| `Paychecks 1 and 3` | Currency / Float | Paycheck amount for paydays landing on days 1–14 or 29–31. |
+| `Name` | String | Optional label for this income source (e.g. `Primary Salary`, `Side Gig`). |
+| `Type` | String | `Biweekly` or `Semi-Monthly`. |
+| `Start Date` | Date | Reference anchor date for 14-day cycle (**Required for Biweekly**; ignored for Semi-Monthly). |
+| `Paycheck Amount` | Currency / Float | Paycheck amount. For Semi-Monthly, paid on 1st & 15th. For Biweekly, paid on days 1–14 & 29–31 (or all days if `Paycheck 2 Amount` is omitted). |
+| `Paycheck 2 Amount` | Currency / Float / Null | Optional alternate amount for Biweekly paydays landing on days 15–28. |
 
 ---
 

@@ -6,10 +6,13 @@ from debt_optimizer import DebtOptimizer, advance_month, make_date, clamp_day, g
 
 def run_self_tests():
     print("======================================================================")
-    print("Running Full Suite of Mathematical Tests (39 Comprehensive Scenarios)")
+    print("Running Full Suite of Mathematical Tests (41 Comprehensive Scenarios)")
     print("======================================================================")
 
-    base_income = {'Start Date': datetime.date(2026, 1, 1), 'Paycheck 2': 2200, 'Paychecks 1 and 3': 2000}
+    # Biweekly income: $2000 on days 1–14/29–31, $2200 on days 15–28, anchored Jan 1 2026.
+    base_income = [{'Type': 'Biweekly', 'Name': 'Primary', 'Start Date': datetime.date(2026, 1, 1), 'Paycheck Amount': 2000, 'Paycheck 2 Amount': 2200}]
+    # Zero-income placeholder for tests that need no income
+    zero_income = [{'Type': 'Biweekly', 'Name': 'None', 'Start Date': datetime.date(2026, 1, 15), 'Paycheck Amount': 0, 'Paycheck 2 Amount': 0}]
     
     # ------------------------------------------------------------------
     # PART 1: ORIGINAL 7 BASELINE TEST SCENARIOS (From Gemini's Draft)
@@ -62,7 +65,7 @@ def run_self_tests():
     opt6 = DebtOptimizer(
         {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 1, 2), 'Initial Checking Balance': 1200, 'Checking Buffer': 1000},
         [], [{'Name': 'Loan', 'Amount Left': 5000, 'APR': 0.05, 'Minimum Payment': 300, 'Due Day': 1}], [],
-        {'Start Date': datetime.date(2026, 1, 15), 'Paycheck 2': 0, 'Paychecks 1 and 3': 0}
+        zero_income
     )
     opt6.run()
     assert opt6.checking == 900.0  # Dipped into 1000 buffer to cover 300 mandatory payment
@@ -72,11 +75,12 @@ def run_self_tests():
     print("Test 7: Biweekly 3-Paycheck Month Schedule (Original 4B)...")
     opt7 = DebtOptimizer(
         {'Start Date': datetime.date(2026, 5, 1), 'End Date': datetime.date(2026, 5, 31), 'Initial Checking Balance': 1000, 'Checking Buffer': 0},
-        [], [], [], {'Start Date': datetime.date(2026, 5, 1), 'Paychecks 1 and 3': 2000, 'Paycheck 2': 2200}
+        [], [], [], [{'Type': 'Biweekly', 'Name': 'Primary', 'Start Date': datetime.date(2026, 5, 1), 'Paycheck Amount': 2000, 'Paycheck 2 Amount': 2200}]
     )
-    assert opt7.get_paycheck_amount(datetime.date(2026, 5, 1)) == 2000
-    assert opt7.get_paycheck_amount(datetime.date(2026, 5, 15)) == 2200
-    assert opt7.get_paycheck_amount(datetime.date(2026, 5, 29)) == 2000
+    # 3 paydays: May 1 (days 1–14 → $2000), May 15 (days 15–28 → $2200), May 29 (days 29–31 → $2000)
+    assert opt7.get_total_income(datetime.date(2026, 5, 1)) == 2000
+    assert opt7.get_total_income(datetime.date(2026, 5, 15)) == 2200
+    assert opt7.get_total_income(datetime.date(2026, 5, 29)) == 2000
     assert opt7.get_next_payday() == datetime.date(2026, 5, 15)
     print("  -> Passed!")
 
@@ -100,7 +104,7 @@ def run_self_tests():
         ],
         [{'Name': 'Loan', 'Amount Left': 10000, 'APR': 0.05, 'Minimum Payment': 300, 'Due Day': 15}],
         [{'Name': 'Rent', 'Amount': 1500, 'Due Day': 1}],
-        {'Start Date': datetime.date(2026, 1, 7), 'Paycheck 2': 2500, 'Paychecks 1 and 3': 2500}
+        [{'Type': 'Biweekly', 'Name': 'Primary', 'Start Date': datetime.date(2026, 1, 7), 'Paycheck Amount': 2500, 'Paycheck 2 Amount': 2500}]
     )
     log9 = opt9.run()
     # On Jan 7: Paycheck arrives. Rent was paid on Jan 1. Checking = 3000.
@@ -185,7 +189,7 @@ def run_self_tests():
     opt18 = DebtOptimizer(
         {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 1, 20), 'Initial Checking Balance': 200, 'Checking Buffer': 200},
         [{'Card': 'FeeCard', 'Issuer': 'American Express', 'APR': 0.20, 'Balance': 500, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 25, 'Statement Balance': 500, 'Min Floor': 40, 'Grace Period Days': 25, 'Annual Fee': 95.0, 'Renewal Date': datetime.date(2026, 1, 15)}],
-        [], [], {'Start Date': datetime.date(2026, 1, 1), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+        [], [], zero_income
     )
     opt18.run()
     assert opt18.ccs[0].balance == 595.0
@@ -194,7 +198,7 @@ def run_self_tests():
     opt18b = DebtOptimizer(
         {'Start Date': datetime.date(2026, 6, 1), 'End Date': datetime.date(2027, 4, 20), 'Initial Checking Balance': 0, 'Checking Buffer': 0},
         [{'Card': 'FeeCard', 'Issuer': 'American Express', 'APR': 0.0, 'Balance': 500, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 25, 'Statement Balance': 0, 'Min Floor': 0, 'Grace Period Days': 25, 'Annual Fee': 95.0, 'Renewal Date': datetime.date(2026, 4, 15)}],
-        [], [], {'Start Date': datetime.date(2026, 6, 1), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+        [], [], zero_income
     )
     opt18b.run()
     total_paid_18b = sum(abs(t['Amount']) for t in opt18b.schedule_log if 'Payment to FeeCard' in t['Description'])
@@ -204,7 +208,7 @@ def run_self_tests():
     opt18c = DebtOptimizer(
         {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2027, 12, 31), 'Initial Checking Balance': 0, 'Checking Buffer': 0},
         [{'Card': 'FeeCard', 'Issuer': 'American Express', 'APR': 0.0, 'Balance': 500, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 25, 'Statement Balance': 0, 'Min Floor': 0, 'Grace Period Days': 25, 'Annual Fee': 95.0, 'Renewal Date': '04/15'}],
-        [], [], {'Start Date': datetime.date(2026, 1, 1), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+        [], [], zero_income
     )
     opt18c.run()
     total_paid_18c = sum(abs(t['Amount']) for t in opt18c.schedule_log if 'Payment to FeeCard' in t['Description'])
@@ -216,7 +220,7 @@ def run_self_tests():
     opt19 = DebtOptimizer(
         {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 1, 26), 'Initial Checking Balance': 5000, 'Checking Buffer': 500},
         [{'Card': 'GraceCard', 'Issuer': 'American Express', 'APR': 0.24, 'Balance': 1000, 'Promo Balance': 0, 'Grace Active': True, 'Due Day': 25, 'Statement Balance': 1000, 'Min Floor': 40, 'Grace Period Days': 25}],
-        [], [], {'Start Date': datetime.date(2026, 1, 1), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+        [], [], zero_income
     )
     log19 = opt19.run()
     assert opt19.ccs[0].grace_active is True
@@ -229,7 +233,7 @@ def run_self_tests():
     opt20 = DebtOptimizer(
         {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 1, 15), 'Initial Checking Balance': 1000, 'Checking Buffer': 0},
         [], [{'Name': 'Loan', 'Amount Left': 1000, 'APR': 0.10, 'Minimum Payment': 300, 'Due Day': 10}], [],
-        {'Start Date': datetime.date(2026, 1, 15), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+        zero_income
     )
     log20 = opt20.run()
     loan_due_payments = [t for t in log20 if t['Date'] == '2026-01-10' and 'Loan Payment' in t['Description']]
@@ -245,7 +249,7 @@ def run_self_tests():
             {'Card': 'HighAPRCard', 'Issuer': 'Discover', 'APR': 0.28, 'Balance': 600, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 25, 'Statement Balance': 600, 'Min Floor': 40, 'Grace Period Days': 25}
         ],
         [{'Name': 'MidAPRLoan', 'Amount Left': 2000, 'APR': 0.20, 'Minimum Payment': 100, 'Due Day': 20}],
-        [], {'Start Date': datetime.date(2026, 1, 15), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+        [], zero_income
     )
     log21 = opt21.run()
     high_pay = [t for t in log21 if 'Extra payment to HighAPRCard' in t['Description']]
@@ -273,7 +277,7 @@ def run_self_tests():
     opt23 = DebtOptimizer(
         {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 7, 1), 'Initial Checking Balance': 1500, 'Checking Buffer': 200},
         [{'Card': 'CycleCard', 'Issuer': 'American Express', 'APR': 0.24, 'Balance': 3000, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 25, 'Statement Balance': 3000, 'Min Floor': 40, 'Grace Period Days': 25}],
-        [], [], {'Start Date': datetime.date(2026, 1, 1), 'Paychecks 1 and 3': 1200, 'Paycheck 2': 1200}
+        [], [], [{'Type': 'Biweekly', 'Name': 'Primary', 'Start Date': datetime.date(2026, 1, 1), 'Paycheck Amount': 1200, 'Paycheck 2 Amount': 1200}]
     )
     opt23.run()
     cc23 = opt23.ccs[0]
@@ -325,7 +329,7 @@ def run_self_tests():
         {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 1, 10), 'Initial Checking Balance': 1000, 'Checking Buffer': 200},
         [{'Card': 'HighAPR', 'Issuer': 'Discover', 'APR': 0.25, 'Balance': 2000, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 25, 'Statement Balance': 2000, 'Min Floor': 40, 'Grace Period Days': 25}],
         [], [{'Name': 'Rent', 'Amount': 300, 'Due Day': 10}],
-        {'Start Date': datetime.date(2026, 1, 15), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+        zero_income
     )
     log26 = opt26.run()
     # Lookahead on Jan 1 must reserve 300 for Rent on Jan 10, leaving 1000 - 200 - 300 = 500 for extra payment
@@ -342,7 +346,7 @@ def run_self_tests():
     opt27 = DebtOptimizer(
         {'Start Date': datetime.date(2026, 1, 10), 'End Date': datetime.date(2026, 1, 16), 'Initial Checking Balance': 500, 'Checking Buffer': 500},
         [{'Card': 'SmallBalCard', 'Issuer': 'Chase', 'APR': 0.20, 'Balance': 15.0, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 15, 'Statement Balance': 500, 'Min Floor': 40, 'Statement Cycle End Day': 25}],
-        [], [], {'Start Date': datetime.date(2026, 1, 25), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+        [], [], zero_income
     )
     log27 = opt27.run()
     pay27 = [t for t in log27 if 'Payment to SmallBalCard' in t['Description']]
@@ -356,7 +360,7 @@ def run_self_tests():
     opt28 = DebtOptimizer(
         {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 1, 20), 'Initial Checking Balance': 1000, 'Checking Buffer': 0},
         [{'Card': 'AmexReset', 'Issuer': 'American Express', 'APR': 0.24, 'Balance': 1000, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 25, 'Statement Balance': 1000, 'Min Floor': 40, 'Grace Period Days': 20}],
-        [], [], {'Start Date': datetime.date(2026, 1, 25), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+        [], [], zero_income
     )
     # Due on Jan 25, grace 20 -> cycle closes Jan 5.
     opt28.run()
@@ -373,7 +377,7 @@ def run_self_tests():
     opt29 = DebtOptimizer(
         {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 3, 5), 'Initial Checking Balance': 1000, 'Checking Buffer': 950},
         [{'Card': 'GraceRestoreCard', 'Issuer': 'American Express', 'APR': 0.20, 'Balance': 25, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 20, 'Statement Balance': 25, 'Min Floor': 25, 'Grace Period Days': 25}],
-        [], [], {'Start Date': datetime.date(2026, 1, 25), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+        [], [], zero_income
     )
     opt29.run()
     assert opt29.ccs[0].grace_active is True
@@ -387,7 +391,7 @@ def run_self_tests():
     opt29b = DebtOptimizer(
         {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 3, 5), 'Initial Checking Balance': 300, 'Checking Buffer': 275},
         [{'Card': 'StreakCard', 'Issuer': 'American Express', 'APR': 0.20, 'Balance': 500, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 20, 'Statement Balance': 500, 'Min Floor': 25, 'Grace Period Days': 25}],
-        [], [], {'Start Date': datetime.date(2026, 2, 15), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+        [], [], zero_income
     )
     opt29b.run()
     assert opt29b.ccs[0].grace_active is False
@@ -399,7 +403,7 @@ def run_self_tests():
     opt30 = DebtOptimizer(
         {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 1, 3), 'Initial Checking Balance': 100, 'Checking Buffer': 0},
         [], [{'Name': 'MicroLoan', 'Amount Left': 0.0001, 'APR': 0.05, 'Minimum Payment': 50, 'Due Day': 15}], [],
-        {'Start Date': datetime.date(2026, 1, 25), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+        zero_income
     )
     opt30.run()
     assert opt30.loans[0].amount_left == 0.0
@@ -445,7 +449,7 @@ def run_self_tests():
     opt32 = DebtOptimizer(
         {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 2, 5), 'Initial Checking Balance': 2000, 'Checking Buffer': 0},
         [{'Card': 'AmexLingeringInt', 'Issuer': 'American Express', 'APR': 0.20, 'Balance': 1000, 'Promo Balance': 0, 'Grace Active': False, 'Due Day': 25, 'Statement Balance': 1000, 'Min Floor': 25, 'Grace Period Days': 25}],
-        [], [], {'Start Date': datetime.date(2026, 1, 25), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+        [], [], zero_income
     )
     # Due day 25, grace 25 -> next_cycle_end = Jan 31; next_due = Jan 25
     assert opt32.ccs[0].next_cycle_end == datetime.date(2026, 1, 31)
@@ -504,7 +508,7 @@ def run_self_tests():
     opt35 = DebtOptimizer(
         {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 1, 5), 'Initial Checking Balance': 0, 'Checking Buffer': 0},
         [], [{'Name': 'AutoLoan', 'Amount Left': 10000.0, 'APR': 0.10, 'Minimum Payment': 300, 'Due Day': 15}], [],
-        {'Start Date': datetime.date(2026, 1, 15), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+        zero_income
     )
     opt35.run()
     loan35 = opt35.loans[0]
@@ -523,7 +527,7 @@ def run_self_tests():
             {'Name': 'Loan2', 'Amount Left': 8000.0, 'APR': 0.07, 'Minimum Payment': 300.0, 'Due Day': 5},
         ],
         [{'Name': 'Rent', 'Amount': 1500.0, 'Due Day': 1}],
-        {'Start Date': datetime.date(2026, 12, 18), 'Paycheck 2': 2000.0, 'Paychecks 1 and 3': 2000.0}
+        [{'Type': 'Biweekly', 'Name': 'Primary', 'Start Date': datetime.date(2026, 12, 18), 'Paycheck Amount': 2000.0, 'Paycheck 2 Amount': 2000.0}]
     )
     schedule36 = opt36.run()
     # On Dec 18, paycheck brings checking to 2300.
@@ -546,7 +550,7 @@ def run_self_tests():
             'Grace Period Days': 25, 'Cycle End Nth Weekday': 0, 'Min Floor': 40.0,
             'Annual Fee': 0.0, 'Renewal Date': None, 'Initial Minimum Payment': 85.0
         }],
-        [], [], {'Start Date': datetime.date(2026, 1, 1), 'Paycheck 2': 0, 'Paychecks 1 and 3': 0}
+        [], [], zero_income
     )
     assert opt37.ccs[0].remaining_min_due == 85.0, "Initial minimum due must honor 'Initial Minimum Payment' column"
     log37 = opt37.run()
@@ -568,7 +572,7 @@ def run_self_tests():
             {'Name': 'Utilities', 'Amount': 250.0, 'Due Day': 1},
             {'Name': 'Astound', 'Amount': 44.13, 'Due Day': 2}
         ],
-        {'Start Date': datetime.date(2026, 12, 25), 'Paycheck 2': 4295.41, 'Paychecks 1 and 3': 4295.41}
+        [{'Type': 'Biweekly', 'Name': 'Primary', 'Start Date': datetime.date(2026, 12, 25), 'Paycheck Amount': 4295.41, 'Paycheck 2 Amount': 4295.41}]
     )
     log38 = opt38.run()
     assert all(t['Checking Balance'] >= 200.0 - 0.005 for t in log38), f"Checking balance dipped below buffer: {[t for t in log38 if t['Checking Balance'] < 200.0]}"
@@ -576,13 +580,13 @@ def run_self_tests():
     assert len(vx_pmts) == 1, "VentureX payment must NOT be skipped in January"
     print("  -> Passed!")
 
-    # Test 39: Priority Hierarchy: Unconditional Debt Minimums (Priority 2 > Priority 3)
-    print("Test 39: Unconditional Debt Minimums Driving Checking Negative (Priority 2 > Priority 3)...")
+    # Test 39: Priority Hierarchy: Unconditional Debt Minimums Driving Checking Negative (Priority 2 > Priority 3 Buffer)
+    print("Test 39: Unconditional Debt Minimums Driving Checking Negative (Priority 2 > Priority 3 Buffer)...")
     opt39 = DebtOptimizer(
         {'Start Date': datetime.date(2026, 1, 1), 'End Date': datetime.date(2026, 1, 5), 'Initial Checking Balance': 50.0, 'Checking Buffer': 100.0},
         [{'Card': 'Card1', 'Issuer': 'Chase', 'APR': 0.20, 'Balance': 1000.0, 'Promo Balance': 0.0, 'Promo End Date': None, 'Statement Cycle End Day': 25, 'Statement Balance': 1000.0, 'Grace Active': False, 'Due Day': 3, 'Grace Period Days': 25, 'Cycle End Nth Weekday': 0, 'Min Floor': 50.0, 'Annual Fee': 0.0, 'Renewal Date': None}],
         [{'Name': 'Loan1', 'Amount Left': 5000.0, 'APR': 0.10, 'Minimum Payment': 200.0, 'Due Day': 2}],
-        [], {'Start Date': datetime.date(2026, 1, 15), 'Paychecks 1 and 3': 0, 'Paycheck 2': 0}
+        [], zero_income
     )
     log39 = opt39.run()
     assert opt39.checking == -200.0, f"Expected checking to be -200.0, got {opt39.checking}"
@@ -592,8 +596,58 @@ def run_self_tests():
     assert len(card_pmt) == 1 and abs(card_pmt[0]['Amount']) == 50.0
     print("  -> Passed!")
 
+    # Test 40: Semi-Monthly Income (1st and 15th of each month, fixed amount)
+    print("Test 40: Semi-Monthly Income Schedule (1st and 15th paydays)...")
+    opt40 = DebtOptimizer(
+        {'Start Date': datetime.date(2026, 2, 1), 'End Date': datetime.date(2026, 2, 28), 'Initial Checking Balance': 1000, 'Checking Buffer': 0},
+        [], [], [],
+        [{'Type': 'Semi-Monthly', 'Name': 'Salary', 'Paycheck Amount': 3000}]
+    )
+    log40 = opt40.run()
+    # Semi-monthly: payday on Feb 1 and Feb 15 — 2 paychecks of $3000 each
+    paydays40 = [t for t in log40 if t['Description'] == 'Paycheck Received']
+    assert len(paydays40) == 2, f"Expected 2 semi-monthly paydays, got {len(paydays40)}"
+    assert paydays40[0]['Date'] == '2026-02-01'
+    assert paydays40[1]['Date'] == '2026-02-15'
+    assert all(abs(t['Amount']) == 3000.0 for t in paydays40)
+    assert opt40.checking == 1000 + 2 * 3000.0
+    # Also verify no payday on Feb 2, 14, 16, 28 etc.
+    non_paydays = [t for t in log40 if t['Description'] == 'Paycheck Received' and t['Date'] not in ('2026-02-01', '2026-02-15')]
+    assert len(non_paydays) == 0
+    # get_total_income returns correct amounts
+    assert opt40.get_total_income(datetime.date(2026, 2, 1)) == 3000.0
+    assert opt40.get_total_income(datetime.date(2026, 2, 15)) == 3000.0
+    assert opt40.get_total_income(datetime.date(2026, 2, 7)) == 0.0
+    print("  -> Passed!")
+
+    # Test 41: Multiple Simultaneous Income Sources (Biweekly + Semi-Monthly)
+    print("Test 41: Multiple Income Sources (Biweekly + Semi-Monthly, summed on shared payday)...")
+    opt41 = DebtOptimizer(
+        {'Start Date': datetime.date(2026, 3, 1), 'End Date': datetime.date(2026, 3, 31), 'Initial Checking Balance': 500, 'Checking Buffer': 0},
+        [], [], [],
+        [
+            {'Type': 'Biweekly', 'Name': 'Job1', 'Start Date': datetime.date(2026, 3, 1), 'Paycheck Amount': 1500, 'Paycheck 2 Amount': 1500},
+            {'Type': 'Semi-Monthly', 'Name': 'Job2', 'Paycheck Amount': 1000}
+        ]
+    )
+    log41 = opt41.run()
+    # March biweekly paydays: Mar 1, Mar 15, Mar 29
+    # Semi-monthly paydays: Mar 1, Mar 15
+    # Shared paydays (Mar 1 and Mar 15): both fire on same day, logged as single combined transaction
+    paydays41 = [t for t in log41 if t['Description'] == 'Paycheck Received']
+    # Mar 1: $1500 (biweekly) + $1000 (semi-monthly) = $2500
+    # Mar 15: $1500 (biweekly) + $1000 (semi-monthly) = $2500
+    # Mar 29: $1500 (biweekly only) = $1500
+    assert len(paydays41) == 3, f"Expected 3 combined paycheck events, got {len(paydays41)}: {[(t['Date'], t['Amount']) for t in paydays41]}"
+    pay_by_date = {t['Date']: t['Amount'] for t in paydays41}
+    assert pay_by_date['2026-03-01'] == 2500.0, f"Mar 1: expected 2500, got {pay_by_date['2026-03-01']}"
+    assert pay_by_date['2026-03-15'] == 2500.0, f"Mar 15: expected 2500, got {pay_by_date['2026-03-15']}"
+    assert pay_by_date['2026-03-29'] == 1500.0, f"Mar 29: expected 1500, got {pay_by_date['2026-03-29']}"
+    assert opt41.checking == 500 + 2500 + 2500 + 1500
+    print("  -> Passed!")
+
     print("\n======================================================================")
-    print("ALL 39 MATHEMATICAL TESTS PASSED PERFECTLY!")
+    print("ALL 41 MATHEMATICAL TESTS PASSED PERFECTLY!")
     print("======================================================================\n")
 
 

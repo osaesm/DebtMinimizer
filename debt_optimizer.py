@@ -112,9 +112,24 @@ class MonthlyPayment:
 
 @dataclass(slots=True)
 class IncomeSchedule:
-    start_date: datetime.date
-    paycheck_2: float
-    paychecks_1_and_3: float
+    """
+    Represents a single income source in the simulation.
+
+    schedule_type: 'biweekly'    — paycheck every 14 days from start_date anchor.
+                   'semi-monthly' — paycheck on the 1st and 15th of every month.
+    start_date:    Required for biweekly (anchor for 14-day cycle). Ignored for semi-monthly.
+    amount:        Fixed paycheck amount for all paydays (semi-monthly), or for paydays
+                   on days 1–14 and 29–31 (biweekly).
+    amount_2:      Optional alternate paycheck amount for biweekly paydays landing on
+                   days 15–28 (e.g., different deductions mid-month). If None, `amount`
+                   is used for all biweekly paydays.
+    name:          Optional label for this income source (e.g., 'Primary', 'Part-Time').
+    """
+    schedule_type: str            # 'biweekly' or 'semi-monthly'
+    amount: float                 # Primary paycheck amount
+    name: str = ''
+    start_date: Optional[datetime.date] = None   # Required for biweekly
+    amount_2: Optional[float] = None              # Biweekly days-15–28 override
 
 
 # =====================================================================
@@ -130,19 +145,18 @@ class DebtOptimizer:
          are executed unconditionally on their due dates.
       2. Pay Minimum Payments on Loans & Credit Cards: Mandatory debt obligations are executed
          unconditionally on their due dates to prevent default and penalties, even if checking
-         cash is depleted (driving the balance negative).
-      3. Positive Checking Balance: Checking is strictly protected against discretionary outflows;
-         only unavoidable mandatory obligations (Priority 1 & Priority 2) may push checking negative.
-      4. Checking Balance Above Buffer: The designated safety cash floor (Checking Buffer) is
-         protected by multi-period forward lookahead simulation. Elective full statement payments
-         (to maintain grace) and extra avalanche payments are made only if the lookahead cushion
-         guarantees the buffer is never breached at any future date.
-      5. Extra Payments (Debt Avalanche): Discretionary surplus cash confirmed safe by the forward
+         cash is depleted (driving the balance negative into overdraft, flagged Deep Red on Output).
+      3. Maintain Checking Balance Above Buffer: The designated safety cash floor (Checking Buffer)
+         must be >= 0, so this also guarantees the checking balance stays non-negative for elective
+         outflows. Elective full statement payments (to maintain grace) and extra avalanche payments
+         are made only if the multi-period forward lookahead guarantees the buffer is never breached
+         through End Date. Any mandatory-only dip below buffer is flagged Light Red on Output.
+      4. Extra Payments (Debt Avalanche): Discretionary surplus cash confirmed safe by the forward
          lookahead engine is waterfalled to active interest-bearing debts, strictly descending by APR.
     """
     def __init__(self, params: Dict[str, Any], ccs: List[Dict[str, Any]],
                  loans: List[Dict[str, Any]], monthly: List[Dict[str, Any]],
-                 income: Dict[str, Any]):
+                 income: Any):
         # Deepcopy to prevent mutating external caller data structures
         self.raw_params = copy.deepcopy(params)
         self.raw_ccs = copy.deepcopy(ccs)
@@ -156,11 +170,45 @@ class DebtOptimizer:
         self.buffer = float(self.raw_params['Checking Buffer'])
         self.current_date = self.start_date
 
-        self.income = IncomeSchedule(
-            start_date=self.raw_income['Start Date'],
-            paycheck_2=float(self.raw_income['Paycheck 2']),
-            paychecks_1_and_3=float(self.raw_income['Paychecks 1 and 3'])
-        )
+        # Build income schedules — accepts a single dict (legacy) or a list of dicts.
+        # Each dict represents one income source with keys:
+        #   'Type'            : 'Biweekly' or 'Semi-Monthly'
+        #   'Start Date'      : anchor date (required for Biweekly; ignored for Semi-Monthly)
+        #   'Paycheck Amount' : fixed amount per paycheck
+        #   'Paycheck 2 Amount': optional alternate amount for biweekly paydays on days 15–28
+        #   'Name'            : optional label
+        # Legacy single-dict format (backward compat):
+        #   {'Start Date': ..., 'Paycheck 2': ..., 'Paychecks 1 and 3': ...}
+        raw_list = self.raw_income if isinstance(self.raw_income, list) else [self.raw_income]
+        self.incomes: List[IncomeSchedule] = []
+        for inc in raw_list:
+            stype = str(inc.get('Type', 'Biweekly')).strip().lower()
+            # Normalize 'semi-monthly' variants
+            if stype in ('semi-monthly', 'semimonthly', 'semi monthly'):
+                stype = 'semi-monthly'
+            else:
+                stype = 'biweekly'
+
+            if stype == 'biweekly':
+                # Legacy keys fallback
+                start = inc.get('Start Date')
+                amt = float(inc.get('Paycheck Amount', inc.get('Paychecks 1 and 3', 0)))
+                amt2_raw = inc.get('Paycheck 2 Amount', inc.get('Paycheck 2'))
+                amt2 = float(amt2_raw) if amt2_raw not in (None, '') else None
+                self.incomes.append(IncomeSchedule(
+                    schedule_type='biweekly',
+                    amount=amt,
+                    name=str(inc.get('Name', '')),
+                    start_date=start,
+                    amount_2=amt2
+                ))
+            else:  # semi-monthly
+                amt = float(inc.get('Paycheck Amount', 0))
+                self.incomes.append(IncomeSchedule(
+                    schedule_type='semi-monthly',
+                    amount=amt,
+                    name=str(inc.get('Name', ''))
+                ))
 
         self.schedule_log: List[Dict[str, Any]] = []
         self.total_interest_paid: float = 0.0
@@ -293,19 +341,56 @@ class DebtOptimizer:
             self.ccs.append(cc_obj)
 
     def get_next_payday(self) -> datetime.date:
-        """Finds the next payday strictly after current_date in O(1) time."""
-        if self.current_date < self.income.start_date:
-            return self.income.start_date
-        cycles = (self.current_date - self.income.start_date).days // 14
-        return self.income.start_date + timedelta(days=(cycles + 1) * 14)
-
-    def is_payday(self, d: datetime.date) -> bool:
-        """Determines if date d is a payday in O(1) time."""
-        return d >= self.income.start_date and (d - self.income.start_date).days % 14 == 0
+        """
+        Finds the next payday strictly after current_date across all biweekly income sources.
+        Returns the earliest next biweekly payday. For semi-monthly sources, paydays are
+        always the 1st and 15th — use is_payday() / get_total_income() instead.
+        (Retained for backward compatibility with tests.)
+        """
+        candidates = []
+        for inc in self.incomes:
+            if inc.schedule_type == 'biweekly' and inc.start_date:
+                if self.current_date < inc.start_date:
+                    candidates.append(inc.start_date)
+                else:
+                    cycles = (self.current_date - inc.start_date).days // 14
+                    candidates.append(inc.start_date + timedelta(days=(cycles + 1) * 14))
+        return min(candidates) if candidates else self.current_date + timedelta(days=14)
 
     def get_paycheck_amount(self, pay_date: datetime.date) -> float:
-        """Determines paycheck amount in O(1) time based on calendar day."""
-        return self.income.paycheck_2 if 15 <= pay_date.day <= 28 else self.income.paychecks_1_and_3
+        """
+        Returns the total income amount on pay_date from all biweekly sources.
+        For biweekly sources: uses amount_2 for days 15–28, amount otherwise.
+        (Retained for backward compatibility with tests.)
+        """
+        total = 0.0
+        for inc in self.incomes:
+            if inc.schedule_type == 'biweekly' and inc.start_date:
+                if pay_date >= inc.start_date and (pay_date - inc.start_date).days % 14 == 0:
+                    if inc.amount_2 is not None and 15 <= pay_date.day <= 28:
+                        total += inc.amount_2
+                    else:
+                        total += inc.amount
+        return total
+
+    def get_total_income(self, d: datetime.date) -> float:
+        """Returns the total income from all sources on date d."""
+        total = 0.0
+        for inc in self.incomes:
+            if inc.schedule_type == 'semi-monthly':
+                if d.day in (1, 15):
+                    total += inc.amount
+            elif inc.schedule_type == 'biweekly' and inc.start_date:
+                if d >= inc.start_date and (d - inc.start_date).days % 14 == 0:
+                    if inc.amount_2 is not None and 15 <= d.day <= 28:
+                        total += inc.amount_2
+                    else:
+                        total += inc.amount
+        return total
+
+    def is_payday(self, d: datetime.date) -> bool:
+        """Returns True if any income source has a payday on date d."""
+        return self.get_total_income(d) > 0.0
 
     # X1 calculates cycle end date using 'grace_days' (typically 23), with a rollback to Friday if the calculated cycle end date is a Saturday.
     @staticmethod
@@ -444,8 +529,10 @@ class DebtOptimizer:
                             cc['bal'] += cc['annual_fee']
 
             # 1. Inflow on future paydays (current_date paycheck is already in self.checking)
-            if d > self.current_date and self.is_payday(d):
-                proj_bal += self.get_paycheck_amount(d)
+            if d > self.current_date:
+                future_income = self.get_total_income(d)
+                if future_income > 0:
+                    proj_bal += future_income
 
             # 2. Monthly payments
             for m in m_trackers:
@@ -521,8 +608,8 @@ class DebtOptimizer:
             # -------------------------------------------------------------
             # 2. Income Processing
             # -------------------------------------------------------------
-            if self.is_payday(self.current_date):
-                pay_amt = self.get_paycheck_amount(self.current_date)
+            pay_amt = self.get_total_income(self.current_date)
+            if pay_amt > 0:
                 self.log_transaction("Paycheck Received", pay_amt)
 
             # -------------------------------------------------------------
@@ -644,7 +731,7 @@ class DebtOptimizer:
                     # Due is remaining minimum or remaining balance (Rule 10)
                     total_loan_owed = loan.amount_left + loan.accrued_interest
                     due_amt = min(total_loan_owed, loan.remaining_min_due)
-                    # Priority 2 > Priority 3: Pay minimum payment unconditionally
+                    # Priority 2: Pay minimum payment unconditionally
                     pay_amt = due_amt
                     if pay_amt > 0:
                         # Simple interest: pay accrued interest first, then reduce principal
@@ -691,12 +778,12 @@ class DebtOptimizer:
                         min_margin = self.get_projected_min_margin()
                         # Safe payment taking multi-period forward lookahead cushion into account
                         safe_target = round(target_pay + min_margin, 2)
-                        # Priority 4 > Priority 5: Pay full statement balance if cash allows (down to buffer);
-                        # Priority 2 > Priority 3: Otherwise, pay at least minimum payment unconditionally
+                        # Priority 3: Pay full statement balance if cash allows (down to buffer);
+                        # Priority 2: Otherwise, pay at least minimum payment unconditionally
                         pay_amt = max(cc.remaining_min_due, min(
                             target_pay, safe_target))
                     else:
-                        # Priority 2 > Priority 3: Pay minimum payment unconditionally
+                        # Priority 2: Pay minimum payment unconditionally
                         pay_amt = cc.remaining_min_due
 
                     # Fix F: Cap payment at total remaining card balance
@@ -1043,20 +1130,30 @@ def run_optimizer_from_sheet(sheet_name: str, creds_path: str, token_path: str, 
             'Due Day': int(parse_float(m.get('Due Day', 1)))
         })
 
-    # 5. Income
+    # 5. Income — supports multiple rows; each row is one income source.
+    # Required columns: 'Type' ('Biweekly' or 'Semi-Monthly'), 'Paycheck Amount'.
+    # Biweekly requires 'Start Date'. Optional: 'Paycheck 2 Amount', 'Name'.
     income_records = sheet.worksheet("Income").get_all_records()
     if not income_records:
         raise ValueError("Worksheet 'Income' is empty.")
-    inc = income_records[0]
-    inc_start = parse_date(inc.get('Start Date'))
-    if not inc_start:
-        alerts.append(
-            "Worksheet 'Income': 'Start Date' is missing or could not be parsed.")
-    income = {
-        'Start Date': inc_start,
-        'Paycheck 2': parse_float(inc.get('Paycheck 2', 0)),
-        'Paychecks 1 and 3': parse_float(inc.get('Paychecks 1 and 3', 0))
-    }
+    income = []
+    for idx, inc in enumerate(income_records, start=2):
+        stype = str(inc.get('Type', 'Biweekly')).strip()
+        if stype.lower() not in ('biweekly', 'semi-monthly', 'semimonthly', 'semi monthly'):
+            alerts.append(
+                f"Worksheet 'Income', row {idx}: 'Type' must be 'Biweekly' or 'Semi-Monthly' (got '{stype}').")
+        inc_start = parse_date(inc.get('Start Date')) if stype.lower() == 'biweekly' else None
+        if stype.lower() == 'biweekly' and not inc_start:
+            alerts.append(
+                f"Worksheet 'Income', row {idx}: 'Start Date' is required for Biweekly income.")
+        amt2_raw = inc.get('Paycheck 2 Amount')
+        income.append({
+            'Name': str(inc.get('Name', '')).strip(),
+            'Type': stype,
+            'Start Date': inc_start,
+            'Paycheck Amount': parse_float(inc.get('Paycheck Amount', 0)),
+            'Paycheck 2 Amount': parse_float(amt2_raw) if amt2_raw not in (None, '') else None,
+        })
 
     # Alert user if any missing or incomplete information was detected
     if alerts:
@@ -1065,7 +1162,11 @@ def run_optimizer_from_sheet(sheet_name: str, creds_path: str, token_path: str, 
         for a in alerts:
             print(f"  [!] {a}")
         print("!" * 75 + "\n")
-        if not params['Start Date'] or not params['End Date'] or not income['Start Date']:
+        has_valid_income_start = any(
+            inc.get('Start Date') or inc.get('Type', '').lower() == 'semi-monthly'
+            for inc in income
+        )
+        if not params['Start Date'] or not params['End Date'] or not has_valid_income_start:
             raise ValueError(
                 "Simulation halted: Required start/end dates are missing. See alerts above.")
 

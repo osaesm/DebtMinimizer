@@ -61,13 +61,12 @@ flowchart TD
 
 ### 4. Cash Flow Priority Hierarchy (Highest to Lowest)
 
-All financial cash flows in the simulation strictly observe a 5-tier priority hierarchy:
+All financial cash flows in the simulation strictly observe a 4-tier priority hierarchy:
 
 1. **Priority 1: Pay Monthly Payments (Fixed Living Expenses)**: Recurring non-debt fixed living expenses (`MonthlyPayment`: Rent, Utilities, Insurance) are paid unconditionally on their due dates.
-2. **Priority 2: Pay Minimum Payments on Loans & Credit Cards**: Mandatory debt minimum payments are executed unconditionally on their due dates to prevent default, penalties, and credit damage, even if cash is depleted.
-3. **Priority 3: Maintain Positive Checking Balance**: Protected against discretionary outflows; only mandatory Priority 1 & 2 commitments may drive checking negative (flagged in Deep Red).
-4. **Priority 4: Maintain Checking Balance Above Buffer**: The safety cash floor (`Checking Buffer`) is protected by multi-period forward lookahead simulation. Full statement payments (to maintain credit card grace) and extra avalanche payments are made only if the forward lookahead cushion guarantees the buffer is never breached. Clustered mandatory bills dipping below buffer (while $\ge 0$) are flagged in Light Red.
-5. **Priority 5: Allocate Extra Payments to Minimize Lifetime Interest (Debt Avalanche)**: Surplus cash confirmed safe by the forward lookahead engine is waterfalled to active interest-bearing debts, strictly descending by APR.
+2. **Priority 2: Pay Minimum Payments on Loans & Credit Cards**: Mandatory debt minimum payments are executed unconditionally on their due dates to prevent default, penalties, and credit damage, even if checking is depleted (driving the balance negative into overdraft, flagged in **Deep Red** on the Output sheet).
+3. **Priority 3: Maintain Checking Balance Above Buffer**: The designated safety cash floor (`Checking Buffer` $\ge 0$) is protected against elective cash allocations. Because `Checking Buffer` $\ge 0$, this also strictly guarantees checking never goes negative for any discretionary outflows. Full statement payments (to maintain credit card grace) and extra avalanche payments are made only if the multi-period forward lookahead cushion guarantees the buffer is never breached. Any mandatory-only dip below buffer (while remaining $\ge 0$) is flagged in **Light Red**.
+4. **Priority 4: Allocate Extra Payments to Minimize Lifetime Interest (Debt Avalanche)**: Surplus cash confirmed safe by the forward lookahead engine is waterfalled to active interest-bearing debts, strictly descending by APR.
 
 ---
 
@@ -121,7 +120,7 @@ Create a Google Spreadsheet named `Debt Optimization Sheet` (or pass a custom na
 | **`CreditCards`** | `Card`, `Issuer`, `APR`, `Balance`, `Promo Balance`, `Promo End Date`, `Statement Cycle End Day`, `Statement Balance`, `Grace Active`, `Due Day`, `Grace Period Days`, `Cycle End Nth Weekday`, `Min Floor`, `Annual Fee`, `Renewal Date`, `Initial Minimum Payment` (Optional) | Supports Chase, Citibank, Amex, Capital One, Discover, and X1 rules. `Initial Minimum Payment` overrides cycle 1 to include billed interest. |
 | **`Loans`** | `Name`, `Amount Left`, `APR`, `Minimum Payment`, `Due Day` | Simple interest installment loans. |
 | **`MonthlyPayments`** | `Name`, `Amount`, `Due Day` | Recurring non-debt bills (rent, utilities, etc.). |
-| **`Income`** | `Start Date`, `Paycheck 2`, `Paychecks 1 and 3` | Biweekly pay schedule (14-day cycle). |
+| **`Income`** | `Type`, `Paycheck Amount`, `Start Date` (Required for Biweekly), `Paycheck 2 Amount` (Optional), `Name` (Optional) | Multiple income schedules supporting `Biweekly` (14-day cycle) and `Semi-Monthly` (1st and 15th of each month). |
 
 ### Output Tab
 The script generates an **`Output`** worksheet:
@@ -163,13 +162,13 @@ On first run, your browser opens to authorize OAuth 2.0 access. A cached `token.
 
 ## Test Coverage & Mathematical Verification
 
-The simulation engine is backed by a 36-scenario test suite in `test_debt_optimizer.py` verifying edge cases, complex issuer rules, and liquidity preservation.
+The simulation engine is backed by a 41-scenario test suite in `test_debt_optimizer.py` verifying edge cases, complex issuer rules, and liquidity preservation.
 
 ### Coverage Summary
 
 | Metric | Result |
 | :--- | :--- |
-| **Test Suite Pass Rate** | **36 / 36 (100%)** |
+| **Test Suite Pass Rate** | **41 / 41 (100%)** |
 | **Core Engine (`debt_optimizer.py`)** | **~99% of engine logic** *(68% file total; remaining 32% is interactive Sheets API I/O)* |
 | **Test File (`test_debt_optimizer.py`)** | **99%** |
 | **Combined Codebase Coverage** | **78%** |
@@ -183,3 +182,9 @@ The simulation engine is backed by a 36-scenario test suite in `test_debt_optimi
   - **Test 34**: Card/issuer dynamic retroactive grace penalty calculation.
   - **Test 35**: Simple interest loan accrual verifying non-compounding principal.
   - **Test 36**: Multi-period forward cash-flow projection preventing buffer breaches across clustered-expense periods.
+- **Advanced Features & Schedules (37–41)**:
+  - **Test 37**: Initial minimum payment column support for cycle 1 billed interest/fees.
+  - **Test 38**: Grace card statement payment with multi-period forward lookahead buffer preservation.
+  - **Test 39**: Unconditional debt minimum payments driving checking account negative (overdraft).
+  - **Test 40**: Semi-monthly income schedule (1st and 15th paydays with fixed amounts).
+  - **Test 41**: Multiple simultaneous income schedules (Biweekly + Semi-Monthly summing on shared paydays).
