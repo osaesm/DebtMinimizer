@@ -1,21 +1,15 @@
+import argparse
+import calendar
+import copy
 import datetime
 from datetime import timedelta
-import calendar
 import math
-from dataclasses import dataclass, field
-from typing import List, Dict, Any, Optional
-import copy
-import argparse
 import sys
-import os
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Union
 
-# Optional imports for Google Sheets I/O
-try:
-    import gspread
-    from google.oauth2.service_account import Credentials
-except ImportError:
-    gspread = None
-    Credentials = None
+import gspread
+from google.oauth2.service_account import Credentials
 
 
 # =====================================================================
@@ -23,113 +17,141 @@ except ImportError:
 # =====================================================================
 
 def clamp_day(year: int, month: int, day: int) -> int:
-    """Clamps a day of month to the valid range for that month (e.g. Feb 31 -> Feb 28)."""
-    max_days = calendar.monthrange(year, month)[1]
-    return min(day, max_days)
+    """Clamps calendar day to valid maximum for given year and month."""
+    return min(day, calendar.monthrange(year, month)[1])
 
 
 def make_date(year: int, month: int, day: int) -> datetime.date:
-    """Creates a date object with the day clamped to the valid range for that month."""
+    """Safely constructs datetime.date with month-end day clamping."""
     return datetime.date(year, month, clamp_day(year, month, day))
 
 
-def advance_month(d: datetime.date, target_day: int, months: int = 1) -> datetime.date:
-    """Advances a date by N months while preserving or clamping to target_day."""
-    total_months = d.month + months - 1
-    new_year = d.year + (total_months // 12)
-    new_month = (total_months % 12) + 1
-    return make_date(new_year, new_month, target_day)
+def advance_month(dt: datetime.date, target_day: int, months: int = 1) -> datetime.date:
+    """Advances or retreats a date by N calendar months, clamping day to month end."""
+    m = dt.year * 12 + dt.month - 1 + months
+    return make_date(m // 12, (m % 12) + 1, target_day)
 
 
 def get_first_due_date(start_date: datetime.date, due_day: int) -> datetime.date:
-    """Finds the first upcoming due date on or after start_date."""
-    d = make_date(start_date.year, start_date.month, due_day)
-    return advance_month(d, due_day) if d < start_date else d
+    """Finds first calendar due date on or after start_date with day clamping."""
+    first = make_date(start_date.year, start_date.month, due_day)
+    return first if first >= start_date else advance_month(first, due_day)
+
+
+def clamp_zero(val: float) -> float:
+    """Clamps sub-cent floating point dust to 0.0."""
+    return 0.0 if abs(val) < 0.005 else val
 
 
 # =====================================================================
-# DATA STRUCTURES (Optimized with slots for memory & performance)
+# DATACLASSES
 # =====================================================================
 
-@dataclass(slots=True)
-class CreditCard:
-    card: str
-    issuer: str
-    apr: float
-    balance: float              # Regular balance subject to APR
-    promo_balance: float        # Balance subject to 0% promo
-    promo_end_date: Optional[datetime.date]
-    statement_cycle_end_day: int  # Chase fixed cycle end day
-    statement_balance: float    # Last statement balance
-    grace_active: bool
+@dataclass
+class IncomeSchedule:
+    schedule_type: str  # 'biweekly' or 'semi-monthly'
+    amount: float
+    start_date: Optional[Union[str, datetime.date]] = None
+    amount_2: Optional[float] = None
+    name: str = ""
+
+    def __post_init__(self):
+        if isinstance(self.start_date, str):
+            self.start_date = parse_date(self.start_date)
+
+    def is_payday(self, dt: datetime.date) -> bool:
+        if self.schedule_type == 'semi-monthly':
+            return dt.day in (1, 15)
+        return bool(self.start_date and dt >= self.start_date and (dt - self.start_date).days % 14 == 0)
+
+    def get_amount(self, dt: datetime.date) -> float:
+        return self.amount_2 if (self.schedule_type == 'biweekly' and self.amount_2 is not None and 15 <= dt.day <= 28) else self.amount
+
+
+@dataclass
+class MonthlyPayment:
+    name: str
+    amount: float
     due_day: int
-    grace_period_days: int      # For Amex, CapOne, Discover, X1
-    cycle_end_nth_weekday: int  # For Citi
-    min_floor: float
-    annual_fee: float
-    renewal_date: Optional[datetime.date]
-    initial_min_payment: Optional[float] = None
-
-    # Internal dynamic simulation state
-    next_due: datetime.date = field(
-        default_factory=lambda: datetime.date(2000, 1, 1))
-    cycle_due_date: datetime.date = field(
-        default_factory=lambda: datetime.date(2000, 1, 1))
-    next_cycle_end: datetime.date = field(
-        default_factory=lambda: datetime.date(2000, 1, 1))
-    adb_reg_acc: float = 0.0
-    days_in_cycle: int = 0
-    amount_paid_this_cycle: float = 0.0
-    remaining_min_due: float = 0.0
-    # Tracks months with full statement balance paid; grace restores at 2
-    consecutive_full_payments: int = 0
+    next_due: Optional[datetime.date] = None
 
 
-@dataclass(slots=True)
+@dataclass
 class Loan:
     name: str
     amount_left: float
     apr: float
     minimum_payment: float
     due_day: int
-
-    # Internal dynamic simulation state
-    next_due: datetime.date = field(
-        default_factory=lambda: datetime.date(2000, 1, 1))
+    next_due: Optional[datetime.date] = None
     remaining_min_due: float = 0.0
     accrued_interest: float = 0.0
     amount_paid_this_cycle: float = 0.0
 
+    def apply_payment(self, amount: float) -> float:
+        """Applies payment: interest first, then principal. Returns interest paid."""
+        pay = min(amount, self.amount_left + self.accrued_interest)
+        if pay <= 0:
+            return 0.0
+        int_pay = min(pay, self.accrued_interest)
+        self.accrued_interest -= int_pay
+        self.amount_left -= (pay - int_pay)
+        if self.amount_left < 0.005:
+            self.amount_left = self.accrued_interest = self.remaining_min_due = 0.0
+        else:
+            self.remaining_min_due = max(0.0, self.remaining_min_due - pay)
+        self.amount_paid_this_cycle += pay
+        return int_pay
 
-@dataclass(slots=True)
-class MonthlyPayment:
-    name: str
-    amount: float
-    due_day: int
-    next_due: datetime.date = field(
-        default_factory=lambda: datetime.date(2000, 1, 1))
 
+@dataclass
+class CreditCard:
+    card: str
+    issuer: str
+    apr: float
+    balance: float
+    promo_balance: float = 0.0
+    promo_end_date: Optional[datetime.date] = None
+    statement_cycle_end_day: int = 0
+    statement_balance: float = 0.0
+    grace_active: bool = False
+    due_day: int = 0
+    grace_period_days: int = 0
+    cycle_end_nth_weekday: int = 0
+    min_floor: float = 0.0
+    annual_fee: float = 0.0
+    renewal_date: Optional[datetime.date] = None
+    initial_min_payment: Optional[float] = None
+    next_due: Optional[datetime.date] = None
+    cycle_due_date: Optional[datetime.date] = None
+    next_cycle_end: Optional[datetime.date] = None
+    days_in_cycle: int = 0
+    adb_reg_acc: float = 0.0
+    remaining_min_due: float = 0.0
+    amount_paid_this_cycle: float = 0.0
+    consecutive_full_payments: int = 0
 
-@dataclass(slots=True)
-class IncomeSchedule:
-    """
-    Represents a single income source in the simulation.
+    def apply_due_payment(self, pay: float):
+        """Applies payment on due date: min to promo first; extra to regular balance first."""
+        min_p = min(pay, self.remaining_min_due)
+        extra = pay - min_p
+        promo_p = min(min_p, self.promo_balance)
+        self.promo_balance -= promo_p
+        self.balance = max(0.0, self.balance - (min_p - promo_p))
+        reg_extra = min(extra, self.balance)
+        self.balance = clamp_zero(self.balance - reg_extra)
+        self.promo_balance = clamp_zero(self.promo_balance - (extra - reg_extra))
+        self.amount_paid_this_cycle += pay
+        self.remaining_min_due = max(0.0, self.remaining_min_due - min_p)
 
-    schedule_type: 'biweekly'    — paycheck every 14 days from start_date anchor.
-                   'semi-monthly' — paycheck on the 1st and 15th of every month.
-    start_date:    Required for biweekly (anchor for 14-day cycle). Ignored for semi-monthly.
-    amount:        Fixed paycheck amount for all paydays (semi-monthly), or for paydays
-                   on days 1–14 and 29–31 (biweekly).
-    amount_2:      Optional alternate paycheck amount for biweekly paydays landing on
-                   days 15–28 (e.g., different deductions mid-month). If None, `amount`
-                   is used for all biweekly paydays.
-    name:          Optional label for this income source (e.g., 'Primary', 'Part-Time').
-    """
-    schedule_type: str            # 'biweekly' or 'semi-monthly'
-    amount: float                 # Primary paycheck amount
-    name: str = ''
-    start_date: Optional[datetime.date] = None   # Required for biweekly
-    amount_2: Optional[float] = None              # Biweekly days-15–28 override
+    def record_full_payment_streak(self, paid_in_full: bool):
+        """Updates consecutive full payment streak for grace restoration (requires 2 consecutive)."""
+        if paid_in_full:
+            self.consecutive_full_payments += 1
+            if self.consecutive_full_payments >= 2:
+                self.grace_active, self.consecutive_full_payments = True, 0
+        else:
+            self.consecutive_full_payments = 0
 
 
 # =====================================================================
@@ -137,48 +159,19 @@ class IncomeSchedule:
 # =====================================================================
 
 class DebtOptimizer:
-    """
-    Deterministic day-by-day personal finance simulation and debt avalanche optimization engine.
+    """Deterministic day-by-day personal finance simulation and debt avalanche optimization engine."""
 
-    Cash Flow Priority Hierarchy (Strict Order from Highest to Lowest):
-      1. Pay Monthly Payments: Recurring non-debt fixed living expenses (Rent, Utilities, Insurance)
-         are executed unconditionally on their due dates.
-      2. Pay Minimum Payments on Loans & Credit Cards: Mandatory debt obligations are executed
-         unconditionally on their due dates to prevent default and penalties, even if checking
-         cash is depleted (driving the balance negative into overdraft, flagged Deep Red on Output).
-      3. Maintain Checking Balance Above Buffer: The designated safety cash floor (Checking Buffer)
-         must be >= 0, so this also guarantees the checking balance stays non-negative for elective
-         outflows. Elective full statement payments (to maintain grace) and extra avalanche payments
-         are made only if the multi-period forward lookahead guarantees the buffer is never breached
-         through End Date. Any mandatory-only dip below buffer is flagged Light Red on Output.
-      4. Extra Payments (Debt Avalanche): Discretionary surplus cash confirmed safe by the forward
-         lookahead engine is waterfalled to active interest-bearing debts, strictly descending by APR.
-    """
     def __init__(self, params: Dict[str, Any], ccs: List[Dict[str, Any]],
                  loans: List[Dict[str, Any]], monthly: List[Dict[str, Any]],
                  income: Any):
-        # Deepcopy to prevent mutating external caller data structures
-        self.raw_params = copy.deepcopy(params)
-        self.raw_ccs = copy.deepcopy(ccs)
-        self.raw_loans = copy.deepcopy(loans)
-        self.raw_monthly = copy.deepcopy(monthly)
-        self.raw_income = copy.deepcopy(income)
-
-        self.start_date = self.raw_params['Start Date']
-        self.end_date = self.raw_params['End Date']
-        self.checking = float(self.raw_params['Initial Checking Balance'])
-        self.buffer = float(self.raw_params['Checking Buffer'])
+        self.raw_params, self.raw_ccs, self.raw_loans, self.raw_monthly, self.raw_income = map(copy.deepcopy, (params, ccs, loans, monthly, income))
+        self.start_date, self.end_date = self.raw_params['Start Date'], self.raw_params['End Date']
+        self.checking, self.buffer = float(self.raw_params['Initial Checking Balance']), float(self.raw_params['Checking Buffer'])
         self.current_date = self.start_date
+        self.schedule_log: List[Dict[str, Any]] = []
+        self.total_interest_paid: float = 0.0
 
-        # Build income schedules — accepts a single dict (legacy) or a list of dicts.
-        # Each dict represents one income source with keys:
-        #   'Type'            : 'Biweekly' or 'Semi-Monthly'
-        #   'Start Date'      : anchor date (required for Biweekly; ignored for Semi-Monthly)
-        #   'Paycheck Amount' : fixed amount per paycheck
-        #   'Paycheck 2 Amount': optional alternate amount for biweekly paydays on days 15–28
-        #   'Name'            : optional label
-        # Legacy single-dict format (backward compat):
-        #   {'Start Date': ..., 'Paycheck 2': ..., 'Paychecks 1 and 3': ...}
+        # Build income schedules
         raw_list = self.raw_income if isinstance(self.raw_income, list) else [self.raw_income]
         self.incomes: List[IncomeSchedule] = []
         for inc in raw_list:
@@ -188,724 +181,313 @@ class DebtOptimizer:
             if raw_amt in (None, ''):
                 raise ValueError(f"Income schedule '{name or 'Income'}' is missing 'Paycheck Amount'.")
             amt = float(raw_amt)
-
             if stype in ('semi-monthly', 'semimonthly', 'semi monthly'):
-                self.incomes.append(IncomeSchedule(
-                    schedule_type='semi-monthly',
-                    amount=amt,
-                    name=name
-                ))
+                self.incomes.append(IncomeSchedule('semi-monthly', amt, name=name))
             elif stype == 'biweekly' or ('Paychecks 1 and 3' in inc and not inc.get('Type')):
                 start = inc.get('Start Date')
                 if start in (None, ''):
                     raise ValueError(f"Biweekly income schedule '{name or 'Income'}' is missing 'Start Date'.")
-                amt2_raw = inc.get('Paycheck 2 Amount') if 'Paycheck 2 Amount' in inc else inc.get('Paycheck 2')
-                amt2 = float(amt2_raw) if amt2_raw not in (None, '') else None
-                self.incomes.append(IncomeSchedule(
-                    schedule_type='biweekly',
-                    amount=amt,
-                    name=name,
-                    start_date=start,
-                    amount_2=amt2
-                ))
+                amt2 = inc.get('Paycheck 2 Amount') if 'Paycheck 2 Amount' in inc else inc.get('Paycheck 2')
+                self.incomes.append(IncomeSchedule('biweekly', amt, start_date=start, amount_2=float(amt2) if amt2 not in (None, '') else None, name=name))
             else:
-                raise ValueError(
-                    f"Invalid or missing income schedule Type: '{inc.get('Type')}'. Must be 'Biweekly' or 'Semi-Monthly'."
-                )
+                raise ValueError(f"Invalid or missing income schedule Type: '{inc.get('Type')}'. Must be 'Biweekly' or 'Semi-Monthly'.")
 
-        self.schedule_log: List[Dict[str, Any]] = []
-        self.total_interest_paid: float = 0.0
-
-        # Build Monthly Payments
-        self.monthly: List[MonthlyPayment] = []
-        for m in self.raw_monthly:
-            due_day = int(m['Due Day'])
-            next_due = get_first_due_date(self.start_date, due_day)
-            self.monthly.append(MonthlyPayment(
-                name=m['Name'],
-                amount=float(m['Amount']),
-                due_day=due_day,
-                next_due=next_due
-            ))
-
-        # Build Loans
-        self.loans: List[Loan] = []
+        # Build Monthly Payments & Loans
+        self.monthly = [MonthlyPayment(m['Name'], float(m['Amount']), int(m['Due Day']), get_first_due_date(self.start_date, int(m['Due Day']))) for m in self.raw_monthly]
+        self.loans = []
         for l in self.raw_loans:
-            due_day = int(l['Due Day'])
-            next_due = get_first_due_date(self.start_date, due_day)
-            amt_left = float(l['Amount Left'])
-            min_pay = float(l['Minimum Payment'])
-            self.loans.append(Loan(
-                name=l['Name'],
-                amount_left=amt_left,
-                apr=float(l['APR']),
-                minimum_payment=min_pay,
-                due_day=due_day,
-                next_due=next_due,
-                remaining_min_due=min(amt_left, min_pay)
-            ))
+            d_day, amt, min_p = int(l['Due Day']), float(l['Amount Left']), float(l['Minimum Payment'])
+            self.loans.append(Loan(l['Name'], amt, float(l['APR']), min_p, d_day, get_first_due_date(self.start_date, d_day), min(amt, min_p)))
 
         # Build Credit Cards
-        self.ccs: List[CreditCard] = []
+        self.ccs = []
         for c in self.raw_ccs:
-            card_name = c.get('Card', '')
             for req in ('Card', 'Issuer', 'APR', 'Balance', 'Statement Balance', 'Grace Active', 'Due Day', 'Min Floor'):
                 if c.get(req) in (None, ''):
-                    raise ValueError(f"Credit card '{card_name or 'Unnamed'}' is missing '{req}'.")
-
-            due_day = int(c['Due Day'])
-            total_bal = float(c['Balance'])
-            promo_bal = float(c.get('Promo Balance', 0.0) or 0.0)
-            # Spec 2d: If there is a promo balance, regular balance subject to standard APR is (Balance - Promo Balance)
-            reg_bal = max(0.0, total_bal -
-                          promo_bal) if promo_bal > 0 else total_bal
-
-            p_end = c.get('Promo End Date')
-            ren_date = c.get('Renewal Date')
-            if isinstance(ren_date, str):
-                ren_date = parse_date(ren_date)
-
-            init_min_raw = c.get('Initial Minimum Payment')
-            if init_min_raw is None or str(init_min_raw).strip() == '':
-                init_min_raw = c.get('First Month Min Payment')
-                if init_min_raw is None or str(init_min_raw).strip() == '':
-                    init_min_raw = c.get('Initial Min Payment')
-            init_min_val = parse_float(init_min_raw) if init_min_raw not in (None, '') else None
-
-            cc_obj = CreditCard(
-                card=c['Card'],
-                issuer=c['Issuer'],
-                apr=float(c['APR']),
-                balance=reg_bal,
-                promo_balance=promo_bal,
-                promo_end_date=p_end,
-                statement_cycle_end_day=int(
-                    c.get('Statement Cycle End Day', 0) or 0),
-                statement_balance=float(c['Statement Balance']),
-                grace_active=bool(c.get('Grace Active', False)),
-                due_day=due_day,
-                grace_period_days=int(c.get('Grace Period Days', 0) or 0),
-                cycle_end_nth_weekday=int(
-                    c.get('Cycle End Nth Weekday', 0) or 0),
-                min_floor=float(c['Min Floor']),
-                annual_fee=float(c.get('Annual Fee', 0.0) or 0.0),
-                renewal_date=ren_date,
-                initial_min_payment=init_min_val
+                    raise ValueError(f"Credit card '{c.get('Card', '') or 'Unnamed'}' is missing '{req}'.")
+            d_day, bal, p_bal = int(c['Due Day']), float(c['Balance']), float(c.get('Promo Balance', 0.0) or 0.0)
+            init_m = c.get('Initial Minimum Payment') or c.get('First Month Min Payment') or c.get('Initial Min Payment')
+            cc = CreditCard(
+                card=c['Card'], issuer=c['Issuer'], apr=float(c['APR']), balance=max(0.0, bal - p_bal) if p_bal > 0 else bal,
+                promo_balance=p_bal, promo_end_date=c.get('Promo End Date'), statement_cycle_end_day=int(c.get('Statement Cycle End Day', 0) or 0),
+                statement_balance=float(c['Statement Balance']), grace_active=bool(c['Grace Active']), due_day=d_day,
+                grace_period_days=int(c.get('Grace Period Days', 0) or 0), cycle_end_nth_weekday=int(c.get('Cycle End Nth Weekday', 0) or 0),
+                min_floor=float(c['Min Floor']), annual_fee=float(c.get('Annual Fee', 0.0) or 0.0),
+                renewal_date=parse_date(c.get('Renewal Date')) if isinstance(c.get('Renewal Date'), str) else c.get('Renewal Date'),
+                initial_min_payment=parse_float(init_m) if init_m not in (None, '') else None
             )
-
-            # 1. Determine next upcoming due date >= start_date
-            next_due = get_first_due_date(self.start_date, due_day)
-            cc_obj.next_due = next_due
-
-            # 2. Cycle end date for statement currently due
-            due_cycle_end = self.calculate_cycle_end_date(
-                cc_obj.issuer, next_due, cc_obj.grace_period_days,
-                cc_obj.cycle_end_nth_weekday, cc_obj.statement_cycle_end_day
-            )
-
-            # 3. Determine next cycle end date & previous cycle end date for ADB initialization
-            if due_cycle_end >= self.start_date:
-                # The cycle for next_due has not closed yet; it closes on due_cycle_end
-                cc_obj.cycle_due_date = next_due
-                cc_obj.next_cycle_end = due_cycle_end
-                prior_due = advance_month(next_due, due_day, -1)
-                prev_cycle_end = self.calculate_cycle_end_date(
-                    cc_obj.issuer, prior_due, cc_obj.grace_period_days,
-                    cc_obj.cycle_end_nth_weekday, cc_obj.statement_cycle_end_day
-                )
+            # Cycle dates & ADB initialization
+            cc.next_due = get_first_due_date(self.start_date, d_day)
+            due_end = self.calculate_cycle_end_date(cc.issuer, cc.next_due, cc.grace_period_days, cc.cycle_end_nth_weekday, cc.statement_cycle_end_day)
+            if due_end >= self.start_date:
+                cc.cycle_due_date, cc.next_cycle_end = cc.next_due, due_end
+                prev_end = self.calculate_cycle_end_date(cc.issuer, advance_month(cc.next_due, d_day, -1), cc.grace_period_days, cc.cycle_end_nth_weekday, cc.statement_cycle_end_day)
             else:
-                # The cycle for next_due already closed before start_date
-                following_due = advance_month(next_due, due_day)
-                next_cycle_end = self.calculate_cycle_end_date(
-                    cc_obj.issuer, following_due, cc_obj.grace_period_days,
-                    cc_obj.cycle_end_nth_weekday, cc_obj.statement_cycle_end_day
-                )
-                while next_cycle_end < self.start_date:
-                    due_cycle_end = next_cycle_end
-                    following_due = advance_month(following_due, due_day)
-                    next_cycle_end = self.calculate_cycle_end_date(
-                        cc_obj.issuer, following_due, cc_obj.grace_period_days,
-                        cc_obj.cycle_end_nth_weekday, cc_obj.statement_cycle_end_day
-                    )
-                cc_obj.cycle_due_date = following_due
-                cc_obj.next_cycle_end = next_cycle_end
-                prev_cycle_end = due_cycle_end
+                f_due = advance_month(cc.next_due, d_day)
+                n_end = self.calculate_cycle_end_date(cc.issuer, f_due, cc.grace_period_days, cc.cycle_end_nth_weekday, cc.statement_cycle_end_day)
+                while n_end < self.start_date:
+                    due_end = n_end
+                    f_due = advance_month(f_due, d_day)
+                    n_end = self.calculate_cycle_end_date(cc.issuer, f_due, cc.grace_period_days, cc.cycle_end_nth_weekday, cc.statement_cycle_end_day)
+                cc.cycle_due_date, cc.next_cycle_end, prev_end = f_due, n_end, due_end
 
-            # 4. Spec 1a: Initialize ADB for mid-cycle start
-            if prev_cycle_end < self.start_date:
-                elapsed_days = (self.start_date - prev_cycle_end).days
-                cc_obj.days_in_cycle = max(0, elapsed_days)
-                cc_obj.adb_reg_acc = cc_obj.balance * cc_obj.days_in_cycle
+            if prev_end < self.start_date:
+                cc.days_in_cycle = max(0, (self.start_date - prev_end).days)
+                cc.adb_reg_acc = cc.balance * cc.days_in_cycle
+            cc.remaining_min_due = min(cc.statement_balance, cc.initial_min_payment) if (cc.initial_min_payment and cc.initial_min_payment > 0 and cc.statement_balance > 0) else self.calc_cc_min_payment(cc.issuer, cc.statement_balance, cc.min_floor)
+            self.ccs.append(cc)
 
-            # 5. Calculate initial minimum payment from starting statement balance
-            if cc_obj.initial_min_payment is not None and cc_obj.initial_min_payment > 0.0:
-                cc_obj.remaining_min_due = min(
-                    cc_obj.statement_balance, cc_obj.initial_min_payment) if cc_obj.statement_balance > 0 else cc_obj.initial_min_payment
-            else:
-                cc_obj.remaining_min_due = self.calc_cc_min_payment(
-                    cc_obj.issuer, cc_obj.statement_balance, cc_obj.min_floor, 0.0, 0.0
-                )
+    # -----------------------------------------------------------------
+    # Incomes, Logging & Formulas
+    # -----------------------------------------------------------------
 
-            self.ccs.append(cc_obj)
+    def get_total_income(self, dt: datetime.date) -> float:
+        """Returns total income credited on dt across all active schedules."""
+        return sum(inc.get_amount(dt) for inc in self.incomes if inc.is_payday(dt))
 
     def get_next_payday(self) -> datetime.date:
-        """
-        Finds the next payday strictly after current_date across all biweekly income sources.
-        Returns the earliest next biweekly payday. For semi-monthly sources, paydays are
-        always the 1st and 15th — use is_payday() / get_total_income() instead.
-        (Retained for backward compatibility with tests.)
-        """
-        candidates = []
-        for inc in self.incomes:
-            if inc.schedule_type == 'biweekly' and inc.start_date:
-                if self.current_date < inc.start_date:
-                    candidates.append(inc.start_date)
-                else:
-                    cycles = (self.current_date - inc.start_date).days // 14
-                    candidates.append(inc.start_date + timedelta(days=(cycles + 1) * 14))
-        return min(candidates) if candidates else self.current_date + timedelta(days=14)
+        """Earliest next biweekly payday strictly after current_date (backward compat)."""
+        bi = [inc.start_date + timedelta(days=((self.current_date - inc.start_date).days // 14 + 1) * 14) if self.current_date >= inc.start_date else inc.start_date for inc in self.incomes if inc.schedule_type == 'biweekly' and inc.start_date]
+        return min(bi) if bi else self.current_date + timedelta(days=14)
 
-    def get_paycheck_amount(self, pay_date: datetime.date) -> float:
-        """
-        Returns the total income amount on pay_date from all biweekly sources.
-        For biweekly sources: uses amount_2 for days 15–28, amount otherwise.
-        (Retained for backward compatibility with tests.)
-        """
-        total = 0.0
-        for inc in self.incomes:
-            if inc.schedule_type == 'biweekly' and inc.start_date:
-                if pay_date >= inc.start_date and (pay_date - inc.start_date).days % 14 == 0:
-                    if inc.amount_2 is not None and 15 <= pay_date.day <= 28:
-                        total += inc.amount_2
-                    else:
-                        total += inc.amount
-        return total
+    def get_paycheck_amount(self, dt: datetime.date) -> float:
+        """Total biweekly income amount on pay_date (backward compat)."""
+        return sum(inc.get_amount(dt) for inc in self.incomes if inc.schedule_type == 'biweekly')
 
-    def get_total_income(self, d: datetime.date) -> float:
-        """Returns the total income from all sources on date d."""
-        total = 0.0
-        for inc in self.incomes:
-            if inc.schedule_type == 'semi-monthly':
-                if d.day in (1, 15):
-                    total += inc.amount
-            elif inc.schedule_type == 'biweekly' and inc.start_date:
-                if d >= inc.start_date and (d - inc.start_date).days % 14 == 0:
-                    if inc.amount_2 is not None and 15 <= d.day <= 28:
-                        total += inc.amount_2
-                    else:
-                        total += inc.amount
-        return total
-
-    def is_payday(self, d: datetime.date) -> bool:
-        """Returns True if any income source has a payday on date d."""
-        return self.get_total_income(d) > 0.0
-
-    # X1 calculates cycle end date using 'grace_days' (typically 23), with a rollback to Friday if the calculated cycle end date is a Saturday.
-    @staticmethod
-    def calculate_cycle_end_date(issuer: str, due_date: datetime.date,
-                                 grace_days: int, citi_weekday: int, chase_day: int) -> datetime.date:
-        """Calculates statement cycle end date based on issuer rules."""
-        if issuer == 'Chase':
-            # Chase uses fixed day of the month
-            if chase_day < due_date.day and (due_date.day - chase_day) >= 15:
-                y, m = due_date.year, due_date.month
-            else:
-                m = due_date.month - 1
-                y = due_date.year
-                if m == 0:
-                    m, y = 12, y - 1
-            return make_date(y, m, chase_day)
-        elif issuer == 'Citibank':
-            # Nth weekday of prior month
-            m = due_date.month - 1
-            y = due_date.year
-            if m == 0:
-                m, y = 12, y - 1
-            count = 0
-            d = datetime.date(y, m, 1)
-            while count < 24:
-                if d.month != m:
-                    raise ValueError(
-                        f"Citibank Cycle End Nth Weekday ({citi_weekday}) exceeds the number "
-                        f"of business days in {y}-{m:02d}."
-                    )
-                if d.weekday() < 5:  # Monday = 0 ... Friday = 4
-                    count += 1
-                    if count == citi_weekday:
-                        return d
-                d += timedelta(days=1)
-            raise ValueError(
-                f"Citibank Cycle End Nth Weekday ({citi_weekday}) exceeds the number "
-                f"of business days in {y}-{m:02d}."
-            )
+    def log_transaction(self, desc: str, amount: float, consolidate: bool = False):
+        """Records transaction, updates checking balance, and clamps to buffer floor."""
+        amt, d_str = round(amount, 2), self.current_date.strftime('%Y-%m-%d')
+        self.checking = round(self.checking + amt, 2)
+        if abs(self.checking - self.buffer) < 0.005:
+            self.checking = round(self.buffer, 2)
+        if consolidate and self.schedule_log and self.schedule_log[-1]['Date'] == d_str and self.schedule_log[-1]['Description'] == desc:
+            self.schedule_log[-1]['Amount'] = round(self.schedule_log[-1]['Amount'] + amt, 2)
+            self.schedule_log[-1]['Checking Balance'] = self.checking
         else:
-            # Amex, Capital One, Discover, X1
-            d = due_date - timedelta(days=grace_days)
-            if issuer == 'X1' and d.weekday() == 5:
-                return d - timedelta(days=1)
-            return d
+            self.schedule_log.append({'Date': d_str, 'Description': desc, 'Amount': amt, 'Checking Balance': self.checking})
+
+    @staticmethod
+    def calculate_cycle_end_date(issuer: str, due_date: datetime.date, grace_period_days: int = 0,
+                                 cycle_end_nth_weekday: int = 0, statement_cycle_end_day: int = 0) -> datetime.date:
+        if issuer == 'Chase':
+            if statement_cycle_end_day <= 0:
+                raise ValueError("statement_cycle_end_day must be > 0 for Chase")
+            if statement_cycle_end_day < due_date.day and (due_date.day - statement_cycle_end_day) >= 15:
+                return make_date(due_date.year, due_date.month, statement_cycle_end_day)
+            pm = 12 if due_date.month == 1 else due_date.month - 1
+            py = due_date.year - 1 if due_date.month == 1 else due_date.year
+            return make_date(py, pm, statement_cycle_end_day)
+
+        if issuer == 'Citibank':
+            if cycle_end_nth_weekday <= 0:
+                raise ValueError("cycle_end_nth_weekday must be > 0 for Citibank")
+            pm = 12 if due_date.month == 1 else due_date.month - 1
+            py = due_date.year - 1 if due_date.month == 1 else due_date.year
+            days = calendar.monthrange(py, pm)[1]
+            bdays = [make_date(py, pm, d) for d in range(1, days + 1) if make_date(py, pm, d).weekday() < 5]
+            if cycle_end_nth_weekday > len(bdays):
+                raise ValueError(f"Citibank cycle_end_nth_weekday={cycle_end_nth_weekday} exceeds the number of business days in prior month ({len(bdays)}).")
+            return bdays[cycle_end_nth_weekday - 1]
+
+        if grace_period_days <= 0:
+            raise ValueError(f"grace_period_days must be > 0 for {issuer}")
+        dt = due_date - timedelta(days=grace_period_days)
+        return dt - timedelta(days=1) if issuer == 'X1' and dt.weekday() == 5 else dt
 
     @staticmethod
     def calc_cc_min_payment(issuer: str, statement_balance: float, min_floor: float,
                             interest_charged: float = 0.0, fees: float = 0.0) -> float:
-        """Calculates credit card minimum payment per Spec 6."""
-        if statement_balance <= 0:
+        if statement_balance <= 0.005:
             return 0.0
         if statement_balance < min_floor:
-            return statement_balance
-
-        principal = max(0.0, statement_balance - interest_charged - fees)
-
+            return round(statement_balance, 2)
+        p = max(0.0, statement_balance - interest_charged - fees)
         if issuer == 'American Express':
-            # trunc(max(Min Floor, Interest + Fees + 1% of Principal, 2% of Principal), 2)
-            calc_amt = int(100*max(min_floor, interest_charged +
-                                   fees + (0.01 * principal), 0.02 * principal)) / 100
+            res = max(min_floor, interest_charged + fees + 0.01 * p, 0.02 * p)
         elif issuer == 'Discover':
-            # Round(max(Min Floor, 20 + Interest + Fees, 2% of statement balance))
-            calc_amt = int(
-                round(max(min_floor, 20.0 + interest_charged + fees, 0.02 * statement_balance)))
-        elif issuer == 'Capital One':
-            # Capital One: Interest + Fees + Round(max(Min Floor, 1% of Principal))
-            calc_amt = interest_charged + fees + \
-                round(max(min_floor, 0.01 * principal))
-        elif issuer == 'Chase':
-            # Chase: Round(Interest + Fees + max(Min Floor, 1% of Principal), 2)
-            calc_amt = interest_charged + fees + \
-                max(min_floor, 0.01 * principal)
+            res = max(min_floor, 20.0 + interest_charged + fees, 0.02 * statement_balance)
         else:
-            # Citibank, X1: Round(Interest + Fees + max(Min Floor, 1% of Principal))
-            calc_amt = round(interest_charged + fees +
-                             max(min_floor, 0.01 * principal))
+            res = interest_charged + fees + max(min_floor, 0.01 * p)
+        return max(0.0, min(round(statement_balance, 2), round(res, 2)))
 
-        return min(statement_balance, round(calc_amt, 2))
-
-    def log_transaction(self, description: str, amount: float):
-        """Logs an actual checking account cash flow transaction."""
-        amt = round(amount, 2)
-        self.checking = round(self.checking + amt, 2)
-        # Prevent floating-point sub-cent drift around buffer floor
-        if abs(self.checking - self.buffer) < 0.005:
-            self.checking = round(self.buffer, 2)
-        self.schedule_log.append({
-            'Date': self.current_date.strftime('%Y-%m-%d'),
-            'Description': description,
-            'Amount': amt,
-            'Checking Balance': self.checking
-        })
+    # -----------------------------------------------------------------
+    # Multi-Period Forward Lookahead Cushion Engine
+    # -----------------------------------------------------------------
 
     def get_projected_min_margin(self) -> float:
-        """
-        Projects forward baseline cash flows from current_date to end_date
-        and returns the minimum projected liquidity margin (projected_balance - buffer).
-        """
+        """Projects forward baseline cash flows to find minimum margin (projected_balance - buffer)."""
         proj_bal = self.checking
         min_margin = proj_bal - self.buffer
-
-        # Lightweight forward trackers
-        m_trackers = [{'amount': m.amount, 'due_day': m.due_day,
-                       'next_due': m.next_due} for m in self.monthly]
-        loan_trackers = [{
-            'bal': l.amount_left + l.accrued_interest,
-            'due_day': l.due_day,
-            'next_due': l.next_due,
-            'rem_min': l.remaining_min_due,
-            'min_pay': l.minimum_payment
-        } for l in self.loans]
-        cc_trackers = [{
-            'bal': cc.balance + cc.promo_balance,
-            'due_day': cc.due_day,
-            'next_due': cc.next_due,
-            'rem_min': cc.remaining_min_due,
-            'stmt_bal': cc.statement_balance,
-            'paid_cycle': cc.amount_paid_this_cycle,
-            'grace': cc.grace_active,
-            'min_floor': cc.min_floor,
-            'issuer': cc.issuer,
-            'annual_fee': cc.annual_fee,
-            'renewal_date': cc.renewal_date
-        } for cc in self.ccs]
+        m_t = [{'amt': m.amount, 'day': m.due_day, 'due': m.next_due} for m in self.monthly]
+        l_t = [{'bal': l.amount_left + l.accrued_interest, 'day': l.due_day, 'due': l.next_due, 'rem': l.remaining_min_due, 'min': l.minimum_payment} for l in self.loans]
+        c_t = [{'bal': c.balance + c.promo_balance, 'day': c.due_day, 'due': c.next_due, 'rem': c.remaining_min_due, 'stmt': c.statement_balance, 'paid': c.amount_paid_this_cycle, 'grace': c.grace_active, 'floor': c.min_floor, 'issuer': c.issuer, 'fee': c.annual_fee, 'ren': c.renewal_date} for c in self.ccs]
 
         d = self.current_date
         while d <= self.end_date:
-            # 0. Annual fee posting on future dates
             if d > self.current_date:
-                for cc in cc_trackers:
-                    if cc['annual_fee'] > 0 and cc['renewal_date']:
-                        target_day = clamp_day(
-                            d.year, cc['renewal_date'].month, cc['renewal_date'].day)
-                        if d.month == cc['renewal_date'].month and d.day == target_day:
-                            cc['bal'] += cc['annual_fee']
-
-            # 1. Inflow on future paydays (current_date paycheck is already in self.checking)
-            if d > self.current_date:
-                future_income = self.get_total_income(d)
-                if future_income > 0:
-                    proj_bal += future_income
-
-            # 2. Monthly payments
-            for m in m_trackers:
-                if d == m['next_due']:
-                    proj_bal -= m['amount']
-                    m['next_due'] = advance_month(m['next_due'], m['due_day'])
-
-            # 3. Loan payments
-            for l in loan_trackers:
-                if l['bal'] > 0.005 and d == l['next_due']:
-                    due_amt = min(l['bal'], l['rem_min'])
-                    proj_bal -= due_amt
-                    l['bal'] = max(0.0, l['bal'] - due_amt)
-                    l['rem_min'] = min(l['bal'], l['min_pay'])
-                    l['next_due'] = advance_month(l['next_due'], l['due_day'])
-
-            # 4. Credit card payments
-            for cc in cc_trackers:
-                if cc['bal'] > 0.005 and d == cc['next_due']:
-                    if cc['grace']:
-                        needed = max(
-                            cc['rem_min'], cc['stmt_bal'] - cc['paid_cycle'])
-                        due_amt = min(needed, cc['bal'])
-                    else:
-                        due_amt = min(cc['rem_min'], cc['bal'])
-                    proj_bal -= due_amt
-                    cc['bal'] = max(0.0, cc['bal'] - due_amt)
-                    cc['stmt_bal'] = cc['bal']
-                    cc['paid_cycle'] = 0.0
-                    cc['rem_min'] = self.calc_cc_min_payment(
-                        cc['issuer'], cc['stmt_bal'], cc['min_floor'], 0.0, 0.0)
-                    cc['next_due'] = advance_month(
-                        cc['next_due'], cc['due_day'])
-
-            # Evaluate cushion
-            margin = proj_bal - self.buffer
-            if margin < min_margin:
-                min_margin = margin
-
+                for c in c_t:
+                    if c['fee'] > 0 and c['ren'] and d.month == c['ren'].month and d.day == clamp_day(d.year, c['ren'].month, c['ren'].day):
+                        c['bal'] += c['fee']
+                proj_bal += self.get_total_income(d)
+            for m in m_t:
+                if d == m['due']:
+                    proj_bal -= m['amt']
+                    m['due'] = advance_month(m['due'], m['day'])
+            for l in l_t:
+                if l['bal'] > 0.005 and d == l['due']:
+                    due = min(l['bal'], l['rem'])
+                    proj_bal -= due
+                    l['bal'] = max(0.0, l['bal'] - due)
+                    l['rem'] = min(l['bal'], l['min'])
+                    l['due'] = advance_month(l['due'], l['day'])
+            for c in c_t:
+                if c['bal'] > 0.005 and d == c['due']:
+                    due = min(max(c['rem'], c['stmt'] - c['paid']), c['bal']) if c['grace'] else min(c['rem'], c['bal'])
+                    proj_bal -= due
+                    c['bal'] = max(0.0, c['bal'] - due)
+                    c['stmt'], c['paid'] = c['bal'], 0.0
+                    c['rem'] = self.calc_cc_min_payment(c['issuer'], c['stmt'], c['floor'])
+                    c['due'] = advance_month(c['due'], c['day'])
+            min_margin = min(min_margin, proj_bal - self.buffer)
             d += timedelta(days=1)
-
         return min_margin
 
     def calculate_disposable_cash(self) -> float:
-        """
-        Calculates safe disposable cash for extra debt payments.
-        Simulates forward baseline cash flows from current_date to end_date
-        to guarantee checking balance never breaches buffer at any future point.
-        """
+        """Calculates safe extra cash that guarantees checking balance never breaches buffer."""
         if self.checking <= self.buffer:
             return 0.0
+        m = self.get_projected_min_margin()
+        return max(0.0, math.floor(round(m, 4) * 100.0) / 100.0) if m > 0.01 else 0.0
 
-        min_margin = self.get_projected_min_margin()
-        if min_margin <= 0.01:
-            return 0.0
-
-        # Floor to cents so we never overspend by even half a cent into the buffer
-        safe_cash = math.floor(round(min_margin, 4) * 100.0) / 100.0
-        return max(0.0, safe_cash)
+    # -----------------------------------------------------------------
+    # Main Simulation Loop
+    # -----------------------------------------------------------------
 
     def run(self) -> List[Dict[str, Any]]:
         while self.current_date <= self.end_date:
-            # -------------------------------------------------------------
-            # 1. Annual Fees Posting on Renewal Date (as regular purchase)
-            # -------------------------------------------------------------
+            # 1. Annual Fees
             for cc in self.ccs:
-                if cc.annual_fee > 0 and cc.renewal_date:
-                    target_day = clamp_day(
-                        self.current_date.year, cc.renewal_date.month, cc.renewal_date.day)
-                    if self.current_date.month == cc.renewal_date.month and self.current_date.day == target_day:
-                        cc.balance += cc.annual_fee
+                if cc.annual_fee > 0 and cc.renewal_date and self.current_date.month == cc.renewal_date.month and self.current_date.day == clamp_day(self.current_date.year, cc.renewal_date.month, cc.renewal_date.day):
+                    cc.balance += cc.annual_fee
 
-            # -------------------------------------------------------------
-            # 2. Income Processing
-            # -------------------------------------------------------------
-            pay_amt = self.get_total_income(self.current_date)
-            if pay_amt > 0:
-                self.log_transaction("Paycheck Received", pay_amt)
+            # 2. Income
+            inc = self.get_total_income(self.current_date)
+            if inc > 0:
+                self.log_transaction("Paycheck Received", inc)
 
-            # -------------------------------------------------------------
-            # 3. Daily Accruals & Promo Expirations
-            # -------------------------------------------------------------
-            for loan in self.loans:
-                if loan.amount_left > 0.005:
-                    loan.accrued_interest += loan.amount_left * \
-                        (loan.apr / 365.0)
+            # 3. Daily Accruals
+            for l in self.loans:
+                if l.amount_left > 0.005:
+                    l.accrued_interest += l.amount_left * (l.apr / 365.0)
                 else:
-                    loan.amount_left = 0.0
-                    loan.accrued_interest = 0.0
-                    loan.remaining_min_due = 0.0
-
+                    l.amount_left = l.accrued_interest = l.remaining_min_due = 0.0
             for cc in self.ccs:
-                # Promo expiration
                 if cc.promo_end_date and self.current_date > cc.promo_end_date:
                     cc.balance += cc.promo_balance
-                    cc.promo_balance = 0.0
-                    cc.promo_end_date = None
-
-                if cc.balance < 0.005:
-                    cc.balance = 0.0
-                if cc.promo_balance < 0.005:
-                    cc.promo_balance = 0.0
-
+                    cc.promo_balance, cc.promo_end_date = 0.0, None
+                cc.balance, cc.promo_balance = clamp_zero(cc.balance), clamp_zero(cc.promo_balance)
                 cc.adb_reg_acc += cc.balance
                 cc.days_in_cycle += 1
 
-            # -------------------------------------------------------------
-            # 4. Look-Ahead Optimizer & Extra Payments
-            # -------------------------------------------------------------
-            # Run extra payment optimizer when checking balance exceeds buffer
+            # 4. Avalanche Extra Payments
             if self.checking > self.buffer:
                 while True:
-                    disposable = self.calculate_disposable_cash()
-                    if disposable <= 0.01:
+                    disp = self.calculate_disposable_cash()
+                    if disp <= 0.01:
                         break
-
-                    candidates = []
-                    for cc in self.ccs:
-                        # Extra payments only target interest-bearing balance
-                        if cc.balance > 0 and not cc.grace_active and cc.apr > 0:
-                            candidates.append(('cc', cc.apr, cc))
-                    for loan in self.loans:
-                        if loan.amount_left > 0 and loan.apr > 0:
-                            candidates.append(('loan', loan.apr, loan))
-
-                    if not candidates:
+                    cands = [('cc', c.apr, c) for c in self.ccs if c.balance > 0 and not c.grace_active and c.apr > 0] + [('loan', l.apr, l) for l in self.loans if l.amount_left > 0 and l.apr > 0]
+                    if not cands:
                         break
-
-                    candidates.sort(key=lambda x: x[1], reverse=True)
-                    target_type, _, target = candidates[0]
-
-                    # Ensure extra payment never dips checking below buffer
-                    max_extra = max(0.0, math.floor(
-                        round(self.checking - self.buffer, 4) * 100.0) / 100.0)
+                    cands.sort(key=lambda x: x[1], reverse=True)
+                    ttype, _, tgt = cands[0]
+                    max_extra = max(0.0, math.floor(round(self.checking - self.buffer, 4) * 100.0) / 100.0)
                     if max_extra <= 0.005:
                         break
-                    pay_amt = min(disposable, max_extra)
-
-                    if target_type == 'cc':
-                        pay_amt = min(pay_amt, target.balance)
-                        if pay_amt <= 0.005:
+                    pay = min(disp, max_extra)
+                    if ttype == 'cc':
+                        pay = min(pay, tgt.balance)
+                        if pay <= 0.005:
                             break
-                        target.balance -= pay_amt
-                        if target.balance < 0.005:
-                            target.balance = 0.0
-                        # Rule 9: Early payment updates remaining minimum
-                        target.remaining_min_due = max(
-                            0.0, target.remaining_min_due - pay_amt)
-                        target.amount_paid_this_cycle += pay_amt
-                        desc = f"Extra payment to {target.card}"
+                        tgt.balance = clamp_zero(tgt.balance - pay)
+                        tgt.remaining_min_due = max(0.0, tgt.remaining_min_due - pay)
+                        tgt.amount_paid_this_cycle += pay
+                        desc = f"Extra payment to {tgt.card}"
                     else:
-                        total_loan_owed = target.amount_left + target.accrued_interest
-                        pay_amt = min(pay_amt, total_loan_owed)
-                        if pay_amt <= 0.005:
+                        pay = min(pay, tgt.amount_left + tgt.accrued_interest)
+                        if pay <= 0.005:
                             break
-                        # Simple interest: pay accrued interest first, then reduce principal
-                        int_pay = min(pay_amt, target.accrued_interest)
-                        target.accrued_interest -= int_pay
-                        target.amount_left -= (pay_amt - int_pay)
-                        self.total_interest_paid += int_pay
-                        if target.amount_left < 0.005:
-                            target.amount_left = 0.0
-                            target.accrued_interest = 0.0
-                            target.remaining_min_due = 0.0
-                        # Rule 9: Early payment updates remaining minimum
-                        target.remaining_min_due = max(
-                            0.0, target.remaining_min_due - pay_amt)
-                        target.amount_paid_this_cycle += pay_amt
-                        desc = f"Extra payment to {target.name}"
+                        self.total_interest_paid += tgt.apply_payment(pay)
+                        desc = f"Extra payment to {tgt.name}"
+                    self.log_transaction(desc, -pay, consolidate=True)
 
-                    # Consolidate into existing same-day transaction for this debt if present
-                    date_str = self.current_date.strftime('%Y-%m-%d')
-                    if self.schedule_log and self.schedule_log[-1]['Date'] == date_str and self.schedule_log[-1]['Description'] == desc:
-                        amt = round(-pay_amt, 2)
-                        self.checking = round(self.checking + amt, 2)
-                        if abs(self.checking - self.buffer) < 0.005:
-                            self.checking = round(self.buffer, 2)
-                        self.schedule_log[-1]['Amount'] = round(self.schedule_log[-1]['Amount'] + amt, 2)
-                        self.schedule_log[-1]['Checking Balance'] = self.checking
-                    else:
-                        self.log_transaction(desc, -pay_amt)
-
-            # -------------------------------------------------------------
-            # 5. Process Mandatory Payments Due Today
-            # -------------------------------------------------------------
-            # Monthly Payments
+            # 5. Mandatory Payments Due Today
             for m in self.monthly:
                 if self.current_date == m.next_due:
-                    self.log_transaction(
-                        f"Monthly Payment: {m.name}", -m.amount)
+                    self.log_transaction(f"Monthly Payment: {m.name}", -m.amount)
                     m.next_due = advance_month(m.next_due, m.due_day)
-
-            # Loan Payments
-            for loan in self.loans:
-                if loan.amount_left > 0.005 and self.current_date == loan.next_due:
-                    # Due is remaining minimum or remaining balance (Rule 10)
-                    total_loan_owed = loan.amount_left + loan.accrued_interest
-                    due_amt = min(total_loan_owed, loan.remaining_min_due)
-                    # Priority 2: Pay minimum payment unconditionally
-                    pay_amt = due_amt
-                    if pay_amt > 0:
-                        # Simple interest: pay accrued interest first, then reduce principal
-                        int_pay = min(pay_amt, loan.accrued_interest)
-                        loan.accrued_interest -= int_pay
-                        loan.amount_left -= (pay_amt - int_pay)
-                        self.total_interest_paid += int_pay
-                        if loan.amount_left < 0.005:
-                            loan.amount_left = 0.0
-                            loan.accrued_interest = 0.0
-                            loan.remaining_min_due = 0.0
-                        self.log_transaction(
-                            f"Loan Payment: {loan.name}", -pay_amt)
-                    loan.remaining_min_due = min(
-                        loan.amount_left + loan.accrued_interest, loan.minimum_payment)
-                    loan.amount_paid_this_cycle = 0.0
-                    loan.next_due = advance_month(loan.next_due, loan.due_day)
-
-            # Credit Card Payments Due Today
+            for l in self.loans:
+                if l.amount_left > 0.005 and self.current_date == l.next_due:
+                    due = min(l.amount_left + l.accrued_interest, l.remaining_min_due)
+                    if due > 0:
+                        self.total_interest_paid += l.apply_payment(due)
+                        self.log_transaction(f"Loan Payment: {l.name}", -due)
+                    l.remaining_min_due = min(l.amount_left + l.accrued_interest, l.minimum_payment)
+                    l.amount_paid_this_cycle = 0.0
+                    l.next_due = advance_month(l.next_due, l.due_day)
             for cc in self.ccs:
                 if self.current_date == cc.next_due:
-                    total_owed = round(cc.balance + cc.promo_balance, 2)
-                    if total_owed <= 0.005:
-                        cc.balance = 0.0
-                        cc.promo_balance = 0.0
-                        cc.remaining_min_due = 0.0
-                        # Fix H: Even if the balance was zeroed by earlier extra payments,
-                        # a full payment was effectively made — update the consecutive streak.
-                        if not cc.grace_active:
-                            if cc.statement_balance > 0.01:
-                                cc.consecutive_full_payments += 1
-                            if cc.consecutive_full_payments >= 2:
-                                cc.grace_active = True
-                                cc.consecutive_full_payments = 0
+                    tot = round(cc.balance + cc.promo_balance, 2)
+                    if tot <= 0.005:
+                        cc.balance = cc.promo_balance = cc.remaining_min_due = 0.0
+                        if not cc.grace_active and cc.statement_balance > 0.01:
+                            cc.record_full_payment_streak(True)
                         cc.amount_paid_this_cycle = 0.0
                         cc.next_due = advance_month(cc.next_due, cc.due_day)
                         continue
-
-                    # Calculate target payment
                     if cc.grace_active:
-                        target_pay = max(
-                            cc.remaining_min_due, cc.statement_balance - cc.amount_paid_this_cycle)
-                        target_pay = min(target_pay, total_owed)
-                        min_margin = self.get_projected_min_margin()
-                        # Safe payment taking multi-period forward lookahead cushion into account
-                        safe_target = round(target_pay + min_margin, 2)
-                        # Priority 3: Pay full statement balance if cash allows (down to buffer);
-                        # Priority 2: Otherwise, pay at least minimum payment unconditionally
-                        pay_amt = max(cc.remaining_min_due, min(
-                            target_pay, safe_target))
+                        tgt_p = min(tot, max(cc.remaining_min_due, cc.statement_balance - cc.amount_paid_this_cycle))
+                        safe_tgt = round(tgt_p + self.get_projected_min_margin(), 2)
+                        pay = max(cc.remaining_min_due, min(tgt_p, safe_tgt))
                     else:
-                        # Priority 2: Pay minimum payment unconditionally
-                        pay_amt = cc.remaining_min_due
+                        pay = cc.remaining_min_due
+                    pay = max(0.0, min(round(pay, 2), tot))
+                    if pay > 0:
+                        cc.apply_due_payment(pay)
+                        self.log_transaction(f"Payment to {cc.card}", -pay)
 
-                    # Fix F: Cap payment at total remaining card balance
-                    pay_amt = min(pay_amt, total_owed)
-                    pay_amt = max(0.0, round(pay_amt, 2))
-
-                    if pay_amt > 0:
-                        # Rule 7: Minimum payment goes to lowest APR first (Promo)
-                        # Any extra portion above minimum goes to highest APR first
-                        min_portion = min(pay_amt, cc.remaining_min_due)
-                        extra_portion = pay_amt - min_portion
-
-                        promo_pay = min(min_portion, cc.promo_balance)
-                        cc.promo_balance -= promo_pay
-                        reg_min_pay = min_portion - promo_pay
-                        cc.balance = max(0.0, cc.balance - reg_min_pay)
-
-                        reg_extra_pay = min(extra_portion, cc.balance)
-                        cc.balance -= reg_extra_pay
-                        rem_extra = extra_portion - reg_extra_pay
-                        cc.promo_balance = max(
-                            0.0, cc.promo_balance - rem_extra)
-
-                        # Fix J: Clamp sub-cent residuals
-                        if cc.balance < 0.005:
-                            cc.balance = 0.0
-                        if cc.promo_balance < 0.005:
-                            cc.promo_balance = 0.0
-
-                        cc.amount_paid_this_cycle += pay_amt
-                        cc.remaining_min_due = max(
-                            0.0, cc.remaining_min_due - min_portion)
-                        self.log_transaction(f"Payment to {cc.card}", -pay_amt)
-
-                    # Rule 3: Check Grace Period status
                     if cc.grace_active:
                         if cc.amount_paid_this_cycle < cc.statement_balance - 0.01:
                             cc.grace_active = False
                             cc.consecutive_full_payments = 0
-                            # Retroactive interest applied to CC balance (NOT checking account)
-                            if cc.grace_period_days > 0:
-                                penalty_days = cc.grace_period_days
-                                if cc.issuer == 'X1':
-                                    prev_cycle_end = self.calculate_cycle_end_date(
-                                        cc.issuer, cc.next_due, cc.grace_period_days, cc.cycle_end_nth_weekday, cc.statement_cycle_end_day)
-                                    penalty_days = max(
-                                        1, (cc.next_due - prev_cycle_end).days)
-                            else:
-                                prev_cycle_end = self.calculate_cycle_end_date(
-                                    cc.issuer, cc.next_due, cc.grace_period_days,
-                                    cc.cycle_end_nth_weekday, cc.statement_cycle_end_day
-                                )
-                                penalty_days = max(
-                                    1, (cc.next_due - prev_cycle_end).days)
-                            penalty = cc.statement_balance * \
-                                (cc.apr / 365.0) * penalty_days
-                            cc.balance += penalty
-                            self.total_interest_paid += penalty
+                            p_days = cc.grace_period_days if cc.grace_period_days > 0 and cc.issuer != 'X1' else max(1, (cc.next_due - self.calculate_cycle_end_date(cc.issuer, cc.next_due, cc.grace_period_days, cc.cycle_end_nth_weekday, cc.statement_cycle_end_day)).days)
+                            pen = cc.statement_balance * (cc.apr / 365.0) * p_days
+                            cc.balance += pen
+                            self.total_interest_paid += pen
                     else:
-                        # Fix H: Grace restores only after 2 consecutive months of full statement payment.
-                        # Interest accrues on lingering charges and new purchases between cycles, so a
-                        # single full payment does not clear all interest-bearing balances; two in a row does.
-                        paid_in_full = cc.statement_balance > 0.01 and cc.amount_paid_this_cycle >= cc.statement_balance - 0.01
-                        if paid_in_full:
-                            cc.consecutive_full_payments += 1
-                        else:
-                            cc.consecutive_full_payments = 0
-                        if cc.consecutive_full_payments >= 2:
-                            cc.grace_active = True
-                            cc.consecutive_full_payments = 0
-
-                    # Advance next due date
+                        cc.record_full_payment_streak(cc.statement_balance > 0.01 and cc.amount_paid_this_cycle >= cc.statement_balance - 0.01)
                     cc.next_due = advance_month(cc.next_due, cc.due_day)
                     cc.amount_paid_this_cycle = 0.0
 
-            # -------------------------------------------------------------
-            # 6. Statement Cycle End Processing
-            # -------------------------------------------------------------
+            # 6. Statement Cycle End
             for cc in self.ccs:
                 if self.current_date == cc.next_cycle_end:
                     interest = 0.0
                     if not cc.grace_active and cc.days_in_cycle > 0:
-                        adb_reg = cc.adb_reg_acc / cc.days_in_cycle
-                        interest = adb_reg * \
-                            (cc.apr / 365.0) * cc.days_in_cycle
+                        interest = (cc.adb_reg_acc / cc.days_in_cycle) * (cc.apr / 365.0) * cc.days_in_cycle
                         cc.balance += interest
                         self.total_interest_paid += interest
-
-                    cc.statement_balance = round(
-                        cc.balance + cc.promo_balance, 2)
-                    cc.remaining_min_due = self.calc_cc_min_payment(
-                        cc.issuer, cc.statement_balance, cc.min_floor, interest, 0.0
-                    )
-
-                    # Reset cycle accumulators
-                    cc.adb_reg_acc = 0.0
-                    cc.days_in_cycle = 0
-                    cc.amount_paid_this_cycle = 0.0  # Fix G: Reset for the new statement cycle
-
-                    # Advance cycle_due_date and calculate next_cycle_end independently
-                    cc.cycle_due_date = advance_month(
-                        cc.cycle_due_date, cc.due_day)
-                    cc.next_cycle_end = self.calculate_cycle_end_date(
-                        cc.issuer, cc.cycle_due_date, cc.grace_period_days,
-                        cc.cycle_end_nth_weekday, cc.statement_cycle_end_day
-                    )
+                    cc.statement_balance = round(cc.balance + cc.promo_balance, 2)
+                    cc.remaining_min_due = self.calc_cc_min_payment(cc.issuer, cc.statement_balance, cc.min_floor, interest)
+                    cc.adb_reg_acc = cc.days_in_cycle = cc.amount_paid_this_cycle = 0.0
+                    cc.cycle_due_date = advance_month(cc.cycle_due_date, cc.due_day)
+                    cc.next_cycle_end = self.calculate_cycle_end_date(cc.issuer, cc.cycle_due_date, cc.grace_period_days, cc.cycle_end_nth_weekday, cc.statement_cycle_end_day)
 
             self.current_date += timedelta(days=1)
-
         return self.schedule_log
 
 
 # =====================================================================
-# COMPREHENSIVE SELF-TEST SUITE (All 21+ Individual Test Cases)
+# SELF-TEST DELEGATOR & GOOGLE SHEETS HELPERS
 # =====================================================================
 
 def run_self_tests():
@@ -913,10 +495,6 @@ def run_self_tests():
     from test_debt_optimizer import run_self_tests as _run_tests
     _run_tests()
 
-
-# =====================================================================
-# GOOGLE SHEETS I/O & PARSING HELPERS
-# =====================================================================
 
 def parse_date(val: Any) -> Optional[datetime.date]:
     """Robust date parsing for Google Sheets inputs."""
@@ -926,40 +504,33 @@ def parse_date(val: Any) -> Optional[datetime.date]:
         return val
     if isinstance(val, datetime.datetime):
         return val.date()
-
-    val_str = str(val).strip()
-    if val_str.lower() in ('none', 'n/a', '-', '', 'null'):
+    s = str(val).strip()
+    if s.lower() in ('none', 'n/a', '-', '', 'null'):
         return None
-
-    # Handle recurring MM/DD format (default year 2000)
-    if '/' in val_str and len(val_str.split('/')) == 2:
+    if '/' in s and len(s.split('/')) == 2:
         try:
-            m, d = map(int, val_str.split('/'))
+            m, d = map(int, s.split('/'))
             return datetime.date(2000, m, d)
         except ValueError:
             pass
-
     for fmt in ('%Y-%m-%d', '%m/%d/%Y', '%m/%d/%y', '%d/%m/%Y'):
         try:
-            return datetime.datetime.strptime(val_str, fmt).date()
+            return datetime.datetime.strptime(s, fmt).date()
         except ValueError:
-            continue
-    raise ValueError(f"Could not parse date string: {val_str}")
+            pass
+    raise ValueError(f"Could not parse date string: {s}")
 
 
 def parse_float(val: Any, default: float = 0.0) -> float:
     """Cleans currency strings, commas, and percentage signs to float."""
-    if val is None or val == '':
+    if val in (None, ''):
         return default
     if isinstance(val, (int, float)):
         return float(val)
     s = str(val).replace('$', '').replace(',', '').replace('%', '').strip()
     try:
         f = float(s)
-        # If original string had '%', convert percentage to decimal
-        if '%' in str(val):
-            return f / 100.0
-        return f
+        return f / 100.0 if '%' in str(val) else f
     except ValueError:
         return default
 
@@ -967,81 +538,38 @@ def parse_float(val: Any, default: float = 0.0) -> float:
 def parse_apr(val: Any) -> float:
     """Parses APR ensuring decimal format (e.g. 24.99% or 24.99 -> 0.2499)."""
     f = parse_float(val)
-    if f > 1.0:
-        f /= 100.0
-    return f
+    return f / 100.0 if f > 1.0 else f
 
 
-def get_google_sheets_client(creds_path: str = "credentials.json",
-                             token_path: str = "token.json",
-                             service_account_path: Optional[str] = None):
-    """
-    Connects to Google Sheets using either:
-    1. OAuth 2.0 User Flow (gspread.oauth) - Recommended & Secure
-    2. Service Account Key file (Credentials.from_service_account_file) - Fallback
-    """
-    if gspread is None:
-        raise ImportError(
-            "gspread library is not installed. Please run: pip install gspread google-auth-oauthlib")
-
-    # If user explicitly requested service account or only service_account.json exists
-    if service_account_path and os.path.exists(service_account_path):
-        print(f"Connecting via Service Account: {service_account_path}...")
-        scope = ["https://www.googleapis.com/auth/spreadsheets",
-                 "https://www.googleapis.com/auth/drive"]
-        creds = Credentials.from_service_account_file(
-            service_account_path, scopes=scope)
-        return gspread.authorize(creds)
-
-    # Primary / Recommended: OAuth 2.0 Desktop App Flow
-    print(
-        f"Connecting via OAuth 2.0 (credentials: {creds_path}, token: {token_path})...")
-    if not os.path.exists(creds_path) and not os.path.exists(token_path):
-        # Fallback check if service_account.json is present
-        if os.path.exists("service_account.json"):
-            print(
-                "Note: credentials.json not found, falling back to service_account.json...")
-            scope = ["https://www.googleapis.com/auth/spreadsheets",
-                     "https://www.googleapis.com/auth/drive"]
-            creds = Credentials.from_service_account_file(
-                "service_account.json", scopes=scope)
-            return gspread.authorize(creds)
-        raise FileNotFoundError(
-            f"OAuth 2.0 client file '{creds_path}' not found.\n"
-            "Download your Desktop Client ID JSON from GCP Console > Credentials, save it as 'credentials.json',\n"
-            "or specify --service-account service_account.json"
-        )
-
-    return gspread.oauth(
-        credentials_filename=creds_path,
-        authorized_user_filename=token_path
-    )
-
-def check_required_fields(row: Dict[str, Any], fields: List[str], sheet_name: str, row_idx: int, name: str, alerts: List[str]):
-    """Checks required fields are non-empty and appends descriptive alerts if missing."""
-    for field in fields:
-        if row.get(field) in (None, ''):
-            alerts.append(f"Worksheet '{sheet_name}', row {row_idx} ({name}): '{field}' is missing.")
+def check_required_fields(row: Dict[str, Any], fields: List[str], sheet: str, idx: int, name: str, alerts: List[str]):
+    for f in fields:
+        if row.get(f) in (None, ''):
+            alerts.append(f"Worksheet '{sheet}', row {idx} ({name}): '{f}' is missing.")
 
 
-def parse_due_day(row: Dict[str, Any], sheet_name: str, row_idx: int, name: str, alerts: List[str]) -> int:
-    """Parses and validates calendar Due Day (1-31). Returns 0 and logs alert if missing or invalid."""
+def parse_due_day(row: Dict[str, Any], sheet: str, idx: int, name: str, alerts: List[str]) -> int:
     raw = row.get('Due Day')
     if raw in (None, ''):
-        alerts.append(f"Worksheet '{sheet_name}', row {row_idx} ({name}): 'Due Day' is missing.")
+        alerts.append(f"Worksheet '{sheet}', row {idx} ({name}): 'Due Day' is missing.")
         return 0
-    day = int(parse_float(raw))
-    if not (1 <= day <= 31):
-        alerts.append(f"Worksheet '{sheet_name}', row {row_idx} ({name}): 'Due Day' ({day}) must be between 1 and 31.")
+    d = int(parse_float(raw))
+    if not (1 <= d <= 31):
+        alerts.append(f"Worksheet '{sheet}', row {idx} ({name}): 'Due Day' ({d}) must be between 1 and 31.")
         return 0
-    return day
+    return d
+
+
+def get_google_sheets_client(creds_path="credentials.json", token_path="token.json", sa_path=None):
+    if sa_path:
+        return gspread.authorize(Credentials.from_service_account_file(sa_path, scopes=["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]))
+    import os
+    if not os.path.exists(creds_path) and not os.path.exists(token_path):
+        raise FileNotFoundError(f"OAuth credentials '{creds_path}' not found. Please provide credentials.json or specify --service-account")
+    return gspread.oauth(credentials_filename=creds_path, authorized_user_filename=token_path)
 
 
 def run_optimizer_from_sheet(sheet_name: str, creds_path: str, token_path: str, service_account_path: Optional[str]):
-    """Reads data from Google Sheets, runs the optimization, and writes schedule output."""
-    client = get_google_sheets_client(
-        creds_path, token_path, service_account_path)
-
+    client = get_google_sheets_client(creds_path, token_path, service_account_path)
     try:
         sheet = client.open(sheet_name)
     except Exception as e:
@@ -1052,112 +580,62 @@ def run_optimizer_from_sheet(sheet_name: str, creds_path: str, token_path: str, 
     alerts: List[str] = []
 
     # 1. Parameters
-    param_records = sheet.worksheet("Parameters").get_all_records()
-    if not param_records:
+    p_recs = sheet.worksheet("Parameters").get_all_records()
+    if not p_recs:
         raise ValueError("Worksheet 'Parameters' is empty.")
-    p = param_records[0]
+    p = p_recs[0]
     check_required_fields(p, ['Start Date', 'End Date', 'Initial Checking Balance', 'Checking Buffer'], 'Parameters', 2, 'Parameters', alerts)
-    params = {
-        'Start Date': parse_date(p.get('Start Date')),
-        'End Date': parse_date(p.get('End Date')),
-        'Initial Checking Balance': parse_float(p.get('Initial Checking Balance')),
-        'Checking Buffer': parse_float(p.get('Checking Buffer'))
-    }
+    params = {'Start Date': parse_date(p.get('Start Date')), 'End Date': parse_date(p.get('End Date')),
+              'Initial Checking Balance': parse_float(p.get('Initial Checking Balance')), 'Checking Buffer': parse_float(p.get('Checking Buffer'))}
 
     # 2. Credit Cards
-    cc_records = sheet.worksheet("CreditCards").get_all_records()
     ccs = []
-    for idx, c in enumerate(cc_records, start=2):
-        card_name = str(c.get('Card') or f'Row {idx}').strip()
-        issuer = str(c.get('Issuer') or '').strip()
-        check_required_fields(c, ['Card', 'Issuer', 'APR', 'Balance', 'Statement Balance', 'Grace Active', 'Min Floor'], 'CreditCards', idx, card_name, alerts)
-
-        if issuer == 'Chase' and not c.get('Statement Cycle End Day'):
-            alerts.append(f"Worksheet 'CreditCards', row {idx} ({card_name}): 'Statement Cycle End Day' is required for Chase cards.")
-        elif issuer == 'Citibank' and not c.get('Cycle End Nth Weekday'):
-            alerts.append(f"Worksheet 'CreditCards', row {idx} ({card_name}): 'Cycle End Nth Weekday' is required for Citibank cards.")
-        elif issuer in ('American Express', 'Capital One', 'Discover', 'X1') and not c.get('Grace Period Days'):
-            alerts.append(f"Worksheet 'CreditCards', row {idx} ({card_name}): 'Grace Period Days' is required for {issuer} cards.")
-
-        due_day = parse_due_day(c, 'CreditCards', idx, card_name, alerts)
-        init_min_raw = c.get('Initial Minimum Payment') or c.get('First Month Min Payment') or c.get('Initial Min Payment')
-        init_min = parse_float(init_min_raw) if init_min_raw not in (None, '') else None
-
+    for idx, c in enumerate(sheet.worksheet("CreditCards").get_all_records(), start=2):
+        cname, iss = str(c.get('Card') or f'Row {idx}').strip(), str(c.get('Issuer') or '').strip()
+        check_required_fields(c, ['Card', 'Issuer', 'APR', 'Balance', 'Statement Balance', 'Grace Active', 'Min Floor'], 'CreditCards', idx, cname, alerts)
+        if iss == 'Chase' and not c.get('Statement Cycle End Day'):
+            alerts.append(f"Worksheet 'CreditCards', row {idx} ({cname}): 'Statement Cycle End Day' is required for Chase cards.")
+        elif iss == 'Citibank' and not c.get('Cycle End Nth Weekday'):
+            alerts.append(f"Worksheet 'CreditCards', row {idx} ({cname}): 'Cycle End Nth Weekday' is required for Citibank cards.")
+        elif iss in ('American Express', 'Capital One', 'Discover', 'X1') and not c.get('Grace Period Days'):
+            alerts.append(f"Worksheet 'CreditCards', row {idx} ({cname}): 'Grace Period Days' is required for {iss} cards.")
+        init_m = c.get('Initial Minimum Payment') or c.get('First Month Min Payment') or c.get('Initial Min Payment')
         ccs.append({
-            'Card': card_name,
-            'Issuer': issuer,
-            'APR': parse_apr(c.get('APR')),
-            'Balance': parse_float(c.get('Balance')),
-            'Promo Balance': parse_float(c.get('Promo Balance')),
-            'Promo End Date': parse_date(c.get('Promo End Date')),
-            'Statement Cycle End Day': int(parse_float(c.get('Statement Cycle End Day'))),
-            'Statement Balance': parse_float(c.get('Statement Balance')),
-            'Grace Active': str(c.get('Grace Active') or '').strip().upper() == 'TRUE',
-            'Due Day': due_day,
-            'Grace Period Days': int(parse_float(c.get('Grace Period Days'))),
-            'Cycle End Nth Weekday': int(parse_float(c.get('Cycle End Nth Weekday'))),
-            'Min Floor': parse_float(c.get('Min Floor')),
-            'Annual Fee': parse_float(c.get('Annual Fee')),
-            'Renewal Date': parse_date(c.get('Renewal Date')),
-            'Initial Minimum Payment': init_min
+            'Card': cname, 'Issuer': iss, 'APR': parse_apr(c.get('APR')), 'Balance': parse_float(c.get('Balance')),
+            'Promo Balance': parse_float(c.get('Promo Balance')), 'Promo End Date': parse_date(c.get('Promo End Date')),
+            'Statement Cycle End Day': int(parse_float(c.get('Statement Cycle End Day'))), 'Statement Balance': parse_float(c.get('Statement Balance')),
+            'Grace Active': str(c.get('Grace Active') or '').strip().upper() == 'TRUE', 'Due Day': parse_due_day(c, 'CreditCards', idx, cname, alerts),
+            'Grace Period Days': int(parse_float(c.get('Grace Period Days'))), 'Cycle End Nth Weekday': int(parse_float(c.get('Cycle End Nth Weekday'))),
+            'Min Floor': parse_float(c.get('Min Floor')), 'Annual Fee': parse_float(c.get('Annual Fee')), 'Renewal Date': parse_date(c.get('Renewal Date')),
+            'Initial Minimum Payment': parse_float(init_m) if init_m not in (None, '') else None
         })
 
-    # 3. Loans
-    loan_records = sheet.worksheet("Loans").get_all_records()
-    loans = []
-    for idx, l in enumerate(loan_records, start=2):
-        loan_name = str(l.get('Name') or f'Row {idx}').strip()
-        check_required_fields(l, ['Amount Left', 'APR', 'Minimum Payment'], 'Loans', idx, loan_name, alerts)
-        due_day = parse_due_day(l, 'Loans', idx, loan_name, alerts)
-        loans.append({
-            'Name': loan_name,
-            'Amount Left': parse_float(l.get('Amount Left')),
-            'APR': parse_apr(l.get('APR')),
-            'Minimum Payment': parse_float(l.get('Minimum Payment')),
-            'Due Day': due_day
-        })
+    # 3. Loans & 4. Monthly
+    loans = [{'Name': str(l.get('Name') or f'Row {i}').strip(), 'Amount Left': parse_float(l.get('Amount Left')), 'APR': parse_apr(l.get('APR')),
+              'Minimum Payment': parse_float(l.get('Minimum Payment')), 'Due Day': parse_due_day(l, 'Loans', i, str(l.get('Name') or f'Row {i}').strip(), alerts)}
+             for i, l in enumerate(sheet.worksheet("Loans").get_all_records(), start=2) if check_required_fields(l, ['Amount Left', 'APR', 'Minimum Payment'], 'Loans', i, str(l.get('Name') or f'Row {i}').strip(), alerts) is None]
+    monthly = [{'Name': str(m.get('Name') or f'Row {i}').strip(), 'Amount': parse_float(m.get('Amount')), 'Due Day': parse_due_day(m, 'MonthlyPayments', i, str(m.get('Name') or f'Row {i}').strip(), alerts)}
+               for i, m in enumerate(sheet.worksheet("MonthlyPayments").get_all_records(), start=2) if check_required_fields(m, ['Amount'], 'MonthlyPayments', i, str(m.get('Name') or f'Row {i}').strip(), alerts) is None]
 
-    # 4. Monthly Payments
-    monthly_records = sheet.worksheet("MonthlyPayments").get_all_records()
-    monthly = []
-    for idx, m in enumerate(monthly_records, start=2):
-        m_name = str(m.get('Name') or f'Row {idx}').strip()
-        check_required_fields(m, ['Amount'], 'MonthlyPayments', idx, m_name, alerts)
-        due_day = parse_due_day(m, 'MonthlyPayments', idx, m_name, alerts)
-        monthly.append({
-            'Name': m_name,
-            'Amount': parse_float(m.get('Amount')),
-            'Due Day': due_day
-        })
-
-    # 5. Income — supports multiple rows; each row is one income source.
-    income_records = sheet.worksheet("Income").get_all_records()
-    if not income_records:
+    # 5. Income
+    inc_recs = sheet.worksheet("Income").get_all_records()
+    if not inc_recs:
         raise ValueError("Worksheet 'Income' is empty.")
     income = []
-    for idx, inc in enumerate(income_records, start=2):
+    for idx, inc in enumerate(inc_recs, start=2):
         check_required_fields(inc, ['Type', 'Paycheck Amount'], 'Income', idx, f'Row {idx}', alerts)
         stype = str(inc.get('Type') or '').strip().lower()
         if stype and stype not in ('biweekly', 'semi-monthly', 'semimonthly', 'semi monthly'):
             alerts.append(f"Worksheet 'Income', row {idx}: 'Type' must be 'Biweekly' or 'Semi-Monthly' (got '{inc.get('Type')}').")
-
         inc_start = parse_date(inc.get('Start Date')) if stype == 'biweekly' else None
         if stype == 'biweekly' and not inc_start:
             alerts.append(f"Worksheet 'Income', row {idx}: 'Start Date' is required for Biweekly income.")
+        amt2 = inc.get('Paycheck 2 Amount')
+        income.append({'Name': str(inc.get('Name') or '').strip(), 'Type': inc.get('Type'), 'Start Date': inc_start,
+                       'Paycheck Amount': parse_float(inc.get('Paycheck Amount')), 'Paycheck 2 Amount': parse_float(amt2) if amt2 not in (None, '') else None})
 
-        amt2_raw = inc.get('Paycheck 2 Amount')
-        income.append({
-            'Name': str(inc.get('Name') or '').strip(),
-            'Type': inc.get('Type'),
-            'Start Date': inc_start,
-            'Paycheck Amount': parse_float(inc.get('Paycheck Amount')),
-            'Paycheck 2 Amount': parse_float(amt2_raw) if amt2_raw not in (None, '') else None,
-        })
-
-    # Alert user and halt if any missing or incomplete information was detected
     if alerts:
-        print("\n" + "!" * 75)
-        print("ALERT: MISSING OR INCOMPLETE INFORMATION DETECTED IN SPREADSHEET:")
+        print("\n" + "!" * 75 + "\nALERT: MISSING OR INCOMPLETE INFORMATION DETECTED IN SPREADSHEET:")
         for a in alerts:
             print(f"  [!] {a}")
         print("!" * 75 + "\n")
@@ -1166,182 +644,72 @@ def run_optimizer_from_sheet(sheet_name: str, creds_path: str, token_path: str, 
     print("Data loaded successfully. Running Debt Minimizer optimization engine...")
     optimizer = DebtOptimizer(params, ccs, loans, monthly, income)
     schedule = optimizer.run()
-
-    # Format & Sort output ledger:
-    # 1. Date ascending
-    # 2. Within same date, Amount descending
     schedule.sort(key=lambda r: (r['Date'], -r['Amount']))
-
-    # Recalculate running checking balance so ledger amounts are strictly cumulative
-    running_bal = round(float(params['Initial Checking Balance']), 2)
     buf = round(float(params['Checking Buffer']), 2)
-    for r in schedule:
-        running_bal = round(running_bal + r['Amount'], 2)
-        if abs(running_bal - buf) < 0.005:
-            running_bal = buf
-        r['Checking Balance'] = running_bal
 
-    print(
-        f"Optimization finished ({len(schedule)} transactions). Writing to 'Output' sheet...")
+    print(f"Optimization finished ({len(schedule)} transactions). Writing to 'Output' sheet...")
     try:
         output_ws = sheet.worksheet("Output")
     except Exception:
-        output_ws = sheet.add_worksheet(
-            title="Output", rows=len(schedule) + 10, cols=10)
-
-    # Ensure sheet has at least 7 columns for column G
+        output_ws = sheet.add_worksheet(title="Output", rows=len(schedule) + 10, cols=10)
     if output_ws.col_count < 7:
         output_ws.add_cols(7 - output_ws.col_count)
 
     output_ws.clear()
-    headers = ["Date", "Description", "Amount",
-               "Checking Balance", "", "", "Total Interest Paid"]
-    rows = [headers]
+    rows = [["Date", "Description", "Amount", "Checking Balance", "", "", "Total Interest Paid"]]
     for idx, r in enumerate(schedule):
         row = [r['Date'], r['Description'], r['Amount'], r['Checking Balance']]
         if idx == 0:
             row.extend(["", "", round(optimizer.total_interest_paid, 2)])
         rows.append(row)
-
     if not schedule:
-        rows.append(["", "", "", "", "", "", round(
-            optimizer.total_interest_paid, 2)])
+        rows.append(["", "", "", "", "", "", round(optimizer.total_interest_paid, 2)])
 
     output_ws.update(rows)
     apply_output_formatting(sheet, output_ws, len(rows), buf)
-    print(
-        f"Success! Payment schedule and total interest paid (${round(optimizer.total_interest_paid, 2):,.2f}) written to Google Sheet.")
+    print(f"Success! Schedule & total interest paid (${round(optimizer.total_interest_paid, 2):,.2f}) written to Google Sheet.")
 
 
 def apply_output_formatting(sheet, output_ws, num_rows: int, buffer_val: float):
-    """
-    Applies conditional formatting to Column D ('Checking Balance') in Output worksheet:
-    1. Deep Red with white bold text for negative checking balance (< 0).
-    2. Light Red with dark red text for checking balance below buffer (0 <= balance < buffer).
-    """
+    """Applies deep red (< 0) and light red (< buffer) conditional formatting to Column D."""
     try:
         meta = sheet.fetch_sheet_metadata({'includeGridData': False})
-        existing_rules_count = 0
-        for s in meta.get('sheets', []):
-            if s.get('properties', {}).get('sheetId') == output_ws.id:
-                existing_rules_count = len(s.get('conditionalFormats', []))
-                break
+        existing = sum(len(s.get('conditionalFormats', [])) for s in meta.get('sheets', []) if s.get('properties', {}).get('sheetId') == output_ws.id)
+        requests = [{"deleteConditionalFormatRule": {"sheetId": output_ws.id, "index": 0}} for _ in range(existing)]
 
-        requests = []
-        for _ in range(existing_rules_count):
-            requests.append({
-                "deleteConditionalFormatRule": {
-                    "sheetId": output_ws.id,
-                    "index": 0
+        def make_rule(val_str: str, bg: Dict[str, float], fg: Dict[str, float]):
+            return {"addConditionalFormatRule": {"rule": {
+                "ranges": [{"sheetId": output_ws.id, "startRowIndex": 1, "endRowIndex": num_rows, "startColumnIndex": 3, "endColumnIndex": 4}],
+                "booleanRule": {
+                    "condition": {"type": "NUMBER_LESS", "values": [{"userEnteredValue": val_str}]},
+                    "format": {"backgroundColor": bg, "textFormat": {"foregroundColor": fg, "bold": True}}
                 }
-            })
+            }, "index": 0}}
 
         if buffer_val > 0:
-            requests.append({
-                "addConditionalFormatRule": {
-                    "rule": {
-                        "ranges": [{
-                            "sheetId": output_ws.id,
-                            "startRowIndex": 1,
-                            "endRowIndex": num_rows,
-                            "startColumnIndex": 3,
-                            "endColumnIndex": 4
-                        }],
-                        "booleanRule": {
-                            "condition": {
-                                "type": "NUMBER_LESS",
-                                "values": [{"userEnteredValue": str(buffer_val)}]
-                            },
-                            "format": {
-                                "backgroundColor": {"red": 1.0, "green": 0.85, "blue": 0.85},  # Light Red
-                                "textFormat": {"foregroundColor": {"red": 0.6, "green": 0.0, "blue": 0.0}, "bold": True}
-                            }
-                        }
-                    },
-                    "index": 0
-                }
-            })
-
-        requests.append({
-            "addConditionalFormatRule": {
-                "rule": {
-                    "ranges": [{
-                        "sheetId": output_ws.id,
-                        "startRowIndex": 1,
-                        "endRowIndex": num_rows,
-                        "startColumnIndex": 3,
-                        "endColumnIndex": 4
-                    }],
-                    "booleanRule": {
-                        "condition": {
-                            "type": "NUMBER_LESS",
-                            "values": [{"userEnteredValue": "0"}]
-                        },
-                        "format": {
-                            "backgroundColor": {"red": 0.85, "green": 0.25, "blue": 0.25},  # Deep Red
-                            "textFormat": {"foregroundColor": {"red": 1.0, "green": 1.0, "blue": 1.0}, "bold": True}
-                        }
-                    }
-                },
-                "index": 0
-            }
-        })
-
-        if requests:
-            sheet.batch_update({"requests": requests})
+            requests.append(make_rule(str(buffer_val), {"red": 1.0, "green": 0.85, "blue": 0.85}, {"red": 0.6, "green": 0.0, "blue": 0.0}))
+        requests.append(make_rule("0", {"red": 0.85, "green": 0.25, "blue": 0.25}, {"red": 1.0, "green": 1.0, "blue": 1.0}))
+        sheet.batch_update({"requests": requests})
     except Exception as e:
         print(f"Note: Could not apply conditional formatting to 'Output' sheet: {e}")
 
 
-# =====================================================================
-# CLI ARGUMENT PARSER
-# =====================================================================
-
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Debt Minimization & Cash Flow Payment Schedule Optimizer"
-    )
-    parser.add_argument(
-        "--test",
-        action="store_true",
-        help="Run comprehensive offline mathematical verification test suite and exit."
-    )
-    parser.add_argument(
-        "--sheet",
-        default="Bank Balance Script 2",
-        help="Google Spreadsheet title (default: 'Bank Balance Script 2')."
-    )
-    parser.add_argument(
-        "--creds",
-        default="credentials.json",
-        help="Path to OAuth2 Desktop Client credentials.json file."
-    )
-    parser.add_argument(
-        "--token",
-        default="token.json",
-        help="Path to cached OAuth2 token.json file."
-    )
-    parser.add_argument(
-        "--service-account",
-        default=None,
-        help="Optional path to service_account.json for service account fallback authentication."
-    )
+    parser = argparse.ArgumentParser(description="Debt Minimization & Cash Flow Payment Schedule Optimizer")
+    parser.add_argument("--test", action="store_true", help="Run offline test suite and exit.")
+    parser.add_argument("--sheet", default="Bank Balance Script 2", help="Google Spreadsheet title.")
+    parser.add_argument("--creds", default="credentials.json", help="OAuth credentials path.")
+    parser.add_argument("--token", default="token.json", help="Cached token path.")
+    parser.add_argument("--service-account", default=None, help="Service account JSON path.")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-
     if args.test:
         run_self_tests()
         sys.exit(0)
-
-    run_optimizer_from_sheet(
-        sheet_name=args.sheet,
-        creds_path=args.creds,
-        token_path=args.token,
-        service_account_path=args.service_account
-    )
+    run_optimizer_from_sheet(args.sheet, args.creds, args.token, args.service_account)
 
 
 if __name__ == "__main__":

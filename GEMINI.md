@@ -35,15 +35,15 @@ python debt_optimizer.py --test
 ### 3. File & Line-Range Quick Reference Map
 Use this map to jump directly to code locations without burning search/grep tokens:
 - **`debt_optimizer.py`**:
-  - `Lines 20–53`: Date utilities (`clamp_day`, `advance_month`, `get_first_due_date`, `make_date`, `parse_date`)
-  - `Lines 55–137`: Dataclasses (`CreditCard`, `Loan`, `MonthlyPayment`, `IncomeSchedule`)
-  - `Lines 139–350`: `DebtOptimizer.__init__` (state setup, renewal normalization, cycle date resolution)
-  - `Lines 351–495`: Income schedules, issuer cycle end logic, credit card minimum payment formulas
-  - `Lines 496–603`: `get_projected_min_margin()`, `calculate_disposable_cash()` (lookahead cushion engine)
-  - `Lines 604–908`: `run()` (daily simulation loop, 6-step order of operations)
-  - `Lines 911–919`: `run_self_tests()` test delegator
-  - `Lines 921–1296`: Google Sheets I/O, parsers, batch Output writer, conditional formatting (`apply_output_formatting`)
-  - `Lines 1298–1348`: CLI argument parsing and entrypoint
+  - `Lines 19–44`: Date utilities (`clamp_day`, `advance_month`, `get_first_due_date`, `make_date`, `clamp_zero`)
+  - `Lines 46–158`: Dataclasses (`IncomeSchedule`, `MonthlyPayment`, `Loan`, `CreditCard`)
+  - `Lines 160–240`: `DebtOptimizer.__init__` & constructor parsing
+  - `Lines 242–314`: Income helpers, transaction logging, cycle end date & min payment formulas
+  - `Lines 316–363`: `get_projected_min_margin()`, `calculate_disposable_cash()` (lookahead cushion engine)
+  - `Lines 365–487`: `run()` (daily simulation loop, 6-step order of operations)
+  - `Lines 489–496`: `run_self_tests()` test delegator
+  - `Lines 498–694`: Google Sheets I/O, parsers, batch Output writer, conditional formatting (`apply_output_formatting`)
+  - `Lines 696–716`: CLI argument parsing and entrypoint
 - **`test_debt_optimizer.py`**:
   - `Tests 1–9`: Baseline issuer formulas and cycle closures
   - `Tests 10–32`: Extended edge cases, month clamping, annual fees, debt avalanche priority
