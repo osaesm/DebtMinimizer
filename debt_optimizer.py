@@ -182,33 +182,36 @@ class DebtOptimizer:
         raw_list = self.raw_income if isinstance(self.raw_income, list) else [self.raw_income]
         self.incomes: List[IncomeSchedule] = []
         for inc in raw_list:
-            stype = str(inc.get('Type', 'Biweekly')).strip().lower()
-            # Normalize 'semi-monthly' variants
-            if stype in ('semi-monthly', 'semimonthly', 'semi monthly'):
-                stype = 'semi-monthly'
-            else:
-                stype = 'biweekly'
+            stype = str(inc.get('Type') or '').strip().lower()
+            name = str(inc.get('Name') or '')
+            raw_amt = inc.get('Paycheck Amount') if inc.get('Paycheck Amount') not in (None, '') else inc.get('Paychecks 1 and 3')
+            if raw_amt in (None, ''):
+                raise ValueError(f"Income schedule '{name or 'Income'}' is missing 'Paycheck Amount'.")
+            amt = float(raw_amt)
 
-            if stype == 'biweekly':
-                # Legacy keys fallback
+            if stype in ('semi-monthly', 'semimonthly', 'semi monthly'):
+                self.incomes.append(IncomeSchedule(
+                    schedule_type='semi-monthly',
+                    amount=amt,
+                    name=name
+                ))
+            elif stype == 'biweekly' or ('Paychecks 1 and 3' in inc and not inc.get('Type')):
                 start = inc.get('Start Date')
-                amt = float(inc.get('Paycheck Amount', inc.get('Paychecks 1 and 3', 0)))
-                amt2_raw = inc.get('Paycheck 2 Amount', inc.get('Paycheck 2'))
+                if start in (None, ''):
+                    raise ValueError(f"Biweekly income schedule '{name or 'Income'}' is missing 'Start Date'.")
+                amt2_raw = inc.get('Paycheck 2 Amount') if 'Paycheck 2 Amount' in inc else inc.get('Paycheck 2')
                 amt2 = float(amt2_raw) if amt2_raw not in (None, '') else None
                 self.incomes.append(IncomeSchedule(
                     schedule_type='biweekly',
                     amount=amt,
-                    name=str(inc.get('Name', '')),
+                    name=name,
                     start_date=start,
                     amount_2=amt2
                 ))
-            else:  # semi-monthly
-                amt = float(inc.get('Paycheck Amount', 0))
-                self.incomes.append(IncomeSchedule(
-                    schedule_type='semi-monthly',
-                    amount=amt,
-                    name=str(inc.get('Name', ''))
-                ))
+            else:
+                raise ValueError(
+                    f"Invalid or missing income schedule Type: '{inc.get('Type')}'. Must be 'Biweekly' or 'Semi-Monthly'."
+                )
 
         self.schedule_log: List[Dict[str, Any]] = []
         self.total_interest_paid: float = 0.0
@@ -245,9 +248,14 @@ class DebtOptimizer:
         # Build Credit Cards
         self.ccs: List[CreditCard] = []
         for c in self.raw_ccs:
+            card_name = c.get('Card', '')
+            for req in ('Card', 'Issuer', 'APR', 'Balance', 'Statement Balance', 'Grace Active', 'Due Day', 'Min Floor'):
+                if c.get(req) in (None, ''):
+                    raise ValueError(f"Credit card '{card_name or 'Unnamed'}' is missing '{req}'.")
+
             due_day = int(c['Due Day'])
-            total_bal = float(c.get('Balance', 0.0))
-            promo_bal = float(c.get('Promo Balance', 0.0))
+            total_bal = float(c['Balance'])
+            promo_bal = float(c.get('Promo Balance', 0.0) or 0.0)
             # Spec 2d: If there is a promo balance, regular balance subject to standard APR is (Balance - Promo Balance)
             reg_bal = max(0.0, total_bal -
                           promo_bal) if promo_bal > 0 else total_bal
@@ -273,13 +281,13 @@ class DebtOptimizer:
                 promo_end_date=p_end,
                 statement_cycle_end_day=int(
                     c.get('Statement Cycle End Day', 0) or 0),
-                statement_balance=float(c.get('Statement Balance', 0.0)),
+                statement_balance=float(c['Statement Balance']),
                 grace_active=bool(c.get('Grace Active', False)),
                 due_day=due_day,
                 grace_period_days=int(c.get('Grace Period Days', 0) or 0),
                 cycle_end_nth_weekday=int(
                     c.get('Cycle End Nth Weekday', 0) or 0),
-                min_floor=float(c.get('Min Floor', 0.0)),
+                min_floor=float(c['Min Floor']),
                 annual_fee=float(c.get('Annual Fee', 0.0) or 0.0),
                 renewal_date=ren_date,
                 initial_min_payment=init_min_val
@@ -1009,6 +1017,25 @@ def get_google_sheets_client(creds_path: str = "credentials.json",
         authorized_user_filename=token_path
     )
 
+def check_required_fields(row: Dict[str, Any], fields: List[str], sheet_name: str, row_idx: int, name: str, alerts: List[str]):
+    """Checks required fields are non-empty and appends descriptive alerts if missing."""
+    for field in fields:
+        if row.get(field) in (None, ''):
+            alerts.append(f"Worksheet '{sheet_name}', row {row_idx} ({name}): '{field}' is missing.")
+
+
+def parse_due_day(row: Dict[str, Any], sheet_name: str, row_idx: int, name: str, alerts: List[str]) -> int:
+    """Parses and validates calendar Due Day (1-31). Returns 0 and logs alert if missing or invalid."""
+    raw = row.get('Due Day')
+    if raw in (None, ''):
+        alerts.append(f"Worksheet '{sheet_name}', row {row_idx} ({name}): 'Due Day' is missing.")
+        return 0
+    day = int(parse_float(raw))
+    if not (1 <= day <= 31):
+        alerts.append(f"Worksheet '{sheet_name}', row {row_idx} ({name}): 'Due Day' ({day}) must be between 1 and 31.")
+        return 0
+    return day
+
 
 def run_optimizer_from_sheet(sheet_name: str, creds_path: str, token_path: str, service_account_path: Optional[str]):
     """Reads data from Google Sheets, runs the optimization, and writes schedule output."""
@@ -1022,153 +1049,119 @@ def run_optimizer_from_sheet(sheet_name: str, creds_path: str, token_path: str, 
         return
 
     print("Loading data from worksheets...")
-    alerts = []
+    alerts: List[str] = []
 
     # 1. Parameters
     param_records = sheet.worksheet("Parameters").get_all_records()
     if not param_records:
         raise ValueError("Worksheet 'Parameters' is empty.")
     p = param_records[0]
-    start_d = parse_date(p.get('Start Date'))
-    end_d = parse_date(p.get('End Date'))
-    if not start_d:
-        alerts.append(
-            "Worksheet 'Parameters': 'Start Date' is missing or could not be parsed.")
-    if not end_d:
-        alerts.append(
-            "Worksheet 'Parameters': 'End Date' is missing or could not be parsed.")
-    if 'Initial Checking Balance' not in p or p.get('Initial Checking Balance') == '':
-        alerts.append(
-            "Worksheet 'Parameters': 'Initial Checking Balance' is missing.")
-    if 'Checking Buffer' not in p or p.get('Checking Buffer') == '':
-        alerts.append(
-            "Worksheet 'Parameters': 'Checking Buffer' is missing (defaulting to 0.0).")
-
+    check_required_fields(p, ['Start Date', 'End Date', 'Initial Checking Balance', 'Checking Buffer'], 'Parameters', 2, 'Parameters', alerts)
     params = {
-        'Start Date': start_d,
-        'End Date': end_d,
-        'Initial Checking Balance': parse_float(p.get('Initial Checking Balance', 0.0)),
-        'Checking Buffer': parse_float(p.get('Checking Buffer', 0.0))
+        'Start Date': parse_date(p.get('Start Date')),
+        'End Date': parse_date(p.get('End Date')),
+        'Initial Checking Balance': parse_float(p.get('Initial Checking Balance')),
+        'Checking Buffer': parse_float(p.get('Checking Buffer'))
     }
 
     # 2. Credit Cards
     cc_records = sheet.worksheet("CreditCards").get_all_records()
     ccs = []
     for idx, c in enumerate(cc_records, start=2):
-        card_name = str(c.get('Card', f'Row {idx}')).strip()
-        issuer = str(c.get('Issuer', '')).strip()
-        if not issuer:
-            alerts.append(
-                f"Worksheet 'CreditCards', row {idx} ({card_name}): 'Issuer' is missing.")
-        elif issuer == 'Chase' and not c.get('Statement Cycle End Day'):
-            alerts.append(
-                f"Worksheet 'CreditCards', row {idx} ({card_name}): 'Statement Cycle End Day' is required for Chase cards.")
+        card_name = str(c.get('Card') or f'Row {idx}').strip()
+        issuer = str(c.get('Issuer') or '').strip()
+        check_required_fields(c, ['Card', 'Issuer', 'APR', 'Balance', 'Statement Balance', 'Grace Active', 'Min Floor'], 'CreditCards', idx, card_name, alerts)
+
+        if issuer == 'Chase' and not c.get('Statement Cycle End Day'):
+            alerts.append(f"Worksheet 'CreditCards', row {idx} ({card_name}): 'Statement Cycle End Day' is required for Chase cards.")
         elif issuer == 'Citibank' and not c.get('Cycle End Nth Weekday'):
-            alerts.append(
-                f"Worksheet 'CreditCards', row {idx} ({card_name}): 'Cycle End Nth Weekday' is required for Citibank cards.")
+            alerts.append(f"Worksheet 'CreditCards', row {idx} ({card_name}): 'Cycle End Nth Weekday' is required for Citibank cards.")
         elif issuer in ('American Express', 'Capital One', 'Discover', 'X1') and not c.get('Grace Period Days'):
-            alerts.append(
-                f"Worksheet 'CreditCards', row {idx} ({card_name}): 'Grace Period Days' is required for {issuer} cards.")
-        if 'Due Day' not in c or c.get('Due Day') == '':
-            alerts.append(
-                f"Worksheet 'CreditCards', row {idx} ({card_name}): 'Due Day' is missing.")
+            alerts.append(f"Worksheet 'CreditCards', row {idx} ({card_name}): 'Grace Period Days' is required for {issuer} cards.")
+
+        due_day = parse_due_day(c, 'CreditCards', idx, card_name, alerts)
+        init_min_raw = c.get('Initial Minimum Payment') or c.get('First Month Min Payment') or c.get('Initial Min Payment')
+        init_min = parse_float(init_min_raw) if init_min_raw not in (None, '') else None
 
         ccs.append({
             'Card': card_name,
             'Issuer': issuer,
-            'APR': parse_apr(c.get('APR', 0)),
-            'Balance': parse_float(c.get('Balance', 0)),
-            'Promo Balance': parse_float(c.get('Promo Balance', 0)),
+            'APR': parse_apr(c.get('APR')),
+            'Balance': parse_float(c.get('Balance')),
+            'Promo Balance': parse_float(c.get('Promo Balance')),
             'Promo End Date': parse_date(c.get('Promo End Date')),
-            'Statement Cycle End Day': int(parse_float(c.get('Statement Cycle End Day', 0))),
-            'Statement Balance': parse_float(c.get('Statement Balance', 0)),
-            'Grace Active': str(c.get('Grace Active', '')).strip().upper() == 'TRUE',
-            'Due Day': int(parse_float(c.get('Due Day', 1))),
-            'Grace Period Days': int(parse_float(c.get('Grace Period Days', 0))),
-            'Cycle End Nth Weekday': int(parse_float(c.get('Cycle End Nth Weekday', 0))),
-            'Min Floor': parse_float(c.get('Min Floor', 0)),
-            'Annual Fee': parse_float(c.get('Annual Fee', 0)),
+            'Statement Cycle End Day': int(parse_float(c.get('Statement Cycle End Day'))),
+            'Statement Balance': parse_float(c.get('Statement Balance')),
+            'Grace Active': str(c.get('Grace Active') or '').strip().upper() == 'TRUE',
+            'Due Day': due_day,
+            'Grace Period Days': int(parse_float(c.get('Grace Period Days'))),
+            'Cycle End Nth Weekday': int(parse_float(c.get('Cycle End Nth Weekday'))),
+            'Min Floor': parse_float(c.get('Min Floor')),
+            'Annual Fee': parse_float(c.get('Annual Fee')),
             'Renewal Date': parse_date(c.get('Renewal Date')),
-            'Initial Minimum Payment': parse_float(c.get('Initial Minimum Payment')) if c.get('Initial Minimum Payment') not in (None, '') else (
-                parse_float(c.get('First Month Min Payment')) if c.get('First Month Min Payment') not in (None, '') else None
-            )
+            'Initial Minimum Payment': init_min
         })
 
     # 3. Loans
     loan_records = sheet.worksheet("Loans").get_all_records()
     loans = []
     for idx, l in enumerate(loan_records, start=2):
-        loan_name = str(l.get('Name', f'Row {idx}')).strip()
-        if 'Due Day' not in l or l.get('Due Day') == '':
-            alerts.append(
-                f"Worksheet 'Loans', row {idx} ({loan_name}): 'Due Day' is missing.")
-        if 'Minimum Payment' not in l or l.get('Minimum Payment') == '':
-            alerts.append(
-                f"Worksheet 'Loans', row {idx} ({loan_name}): 'Minimum Payment' is missing.")
+        loan_name = str(l.get('Name') or f'Row {idx}').strip()
+        check_required_fields(l, ['Amount Left', 'APR', 'Minimum Payment'], 'Loans', idx, loan_name, alerts)
+        due_day = parse_due_day(l, 'Loans', idx, loan_name, alerts)
         loans.append({
             'Name': loan_name,
-            'Amount Left': parse_float(l.get('Amount Left', 0)),
-            'APR': parse_apr(l.get('APR', 0)),
-            'Minimum Payment': parse_float(l.get('Minimum Payment', 0)),
-            'Due Day': int(parse_float(l.get('Due Day', 1)))
+            'Amount Left': parse_float(l.get('Amount Left')),
+            'APR': parse_apr(l.get('APR')),
+            'Minimum Payment': parse_float(l.get('Minimum Payment')),
+            'Due Day': due_day
         })
 
     # 4. Monthly Payments
     monthly_records = sheet.worksheet("MonthlyPayments").get_all_records()
     monthly = []
     for idx, m in enumerate(monthly_records, start=2):
-        m_name = str(m.get('Name', f'Row {idx}')).strip()
-        if 'Due Day' not in m or m.get('Due Day') == '':
-            alerts.append(
-                f"Worksheet 'MonthlyPayments', row {idx} ({m_name}): 'Due Day' is missing.")
-        if 'Amount' not in m or m.get('Amount') == '':
-            alerts.append(
-                f"Worksheet 'MonthlyPayments', row {idx} ({m_name}): 'Amount' is missing.")
+        m_name = str(m.get('Name') or f'Row {idx}').strip()
+        check_required_fields(m, ['Amount'], 'MonthlyPayments', idx, m_name, alerts)
+        due_day = parse_due_day(m, 'MonthlyPayments', idx, m_name, alerts)
         monthly.append({
             'Name': m_name,
-            'Amount': parse_float(m.get('Amount', 0)),
-            'Due Day': int(parse_float(m.get('Due Day', 1)))
+            'Amount': parse_float(m.get('Amount')),
+            'Due Day': due_day
         })
 
     # 5. Income — supports multiple rows; each row is one income source.
-    # Required columns: 'Type' ('Biweekly' or 'Semi-Monthly'), 'Paycheck Amount'.
-    # Biweekly requires 'Start Date'. Optional: 'Paycheck 2 Amount', 'Name'.
     income_records = sheet.worksheet("Income").get_all_records()
     if not income_records:
         raise ValueError("Worksheet 'Income' is empty.")
     income = []
     for idx, inc in enumerate(income_records, start=2):
-        stype = str(inc.get('Type', 'Biweekly')).strip()
-        if stype.lower() not in ('biweekly', 'semi-monthly', 'semimonthly', 'semi monthly'):
-            alerts.append(
-                f"Worksheet 'Income', row {idx}: 'Type' must be 'Biweekly' or 'Semi-Monthly' (got '{stype}').")
-        inc_start = parse_date(inc.get('Start Date')) if stype.lower() == 'biweekly' else None
-        if stype.lower() == 'biweekly' and not inc_start:
-            alerts.append(
-                f"Worksheet 'Income', row {idx}: 'Start Date' is required for Biweekly income.")
+        check_required_fields(inc, ['Type', 'Paycheck Amount'], 'Income', idx, f'Row {idx}', alerts)
+        stype = str(inc.get('Type') or '').strip().lower()
+        if stype and stype not in ('biweekly', 'semi-monthly', 'semimonthly', 'semi monthly'):
+            alerts.append(f"Worksheet 'Income', row {idx}: 'Type' must be 'Biweekly' or 'Semi-Monthly' (got '{inc.get('Type')}').")
+
+        inc_start = parse_date(inc.get('Start Date')) if stype == 'biweekly' else None
+        if stype == 'biweekly' and not inc_start:
+            alerts.append(f"Worksheet 'Income', row {idx}: 'Start Date' is required for Biweekly income.")
+
         amt2_raw = inc.get('Paycheck 2 Amount')
         income.append({
-            'Name': str(inc.get('Name', '')).strip(),
-            'Type': stype,
+            'Name': str(inc.get('Name') or '').strip(),
+            'Type': inc.get('Type'),
             'Start Date': inc_start,
-            'Paycheck Amount': parse_float(inc.get('Paycheck Amount', 0)),
+            'Paycheck Amount': parse_float(inc.get('Paycheck Amount')),
             'Paycheck 2 Amount': parse_float(amt2_raw) if amt2_raw not in (None, '') else None,
         })
 
-    # Alert user if any missing or incomplete information was detected
+    # Alert user and halt if any missing or incomplete information was detected
     if alerts:
         print("\n" + "!" * 75)
         print("ALERT: MISSING OR INCOMPLETE INFORMATION DETECTED IN SPREADSHEET:")
         for a in alerts:
             print(f"  [!] {a}")
         print("!" * 75 + "\n")
-        has_valid_income_start = any(
-            inc.get('Start Date') or inc.get('Type', '').lower() == 'semi-monthly'
-            for inc in income
-        )
-        if not params['Start Date'] or not params['End Date'] or not has_valid_income_start:
-            raise ValueError(
-                "Simulation halted: Required start/end dates are missing. See alerts above.")
+        raise ValueError("Simulation halted: Required configuration fields are missing or invalid. See alerts above.")
 
     print("Data loaded successfully. Running Debt Minimizer optimization engine...")
     optimizer = DebtOptimizer(params, ccs, loans, monthly, income)
@@ -1181,7 +1174,7 @@ def run_optimizer_from_sheet(sheet_name: str, creds_path: str, token_path: str, 
 
     # Recalculate running checking balance so ledger amounts are strictly cumulative
     running_bal = round(float(params['Initial Checking Balance']), 2)
-    buf = round(float(params.get('Checking Buffer', 0.0)), 2)
+    buf = round(float(params['Checking Buffer']), 2)
     for r in schedule:
         running_bal = round(running_bal + r['Amount'], 2)
         if abs(running_bal - buf) < 0.005:

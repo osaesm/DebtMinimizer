@@ -35,15 +35,15 @@ python debt_optimizer.py --test
 ### 3. File & Line-Range Quick Reference Map
 Use this map to jump directly to code locations without burning search/grep tokens:
 - **`debt_optimizer.py`**:
-  - `Lines 20–48`: Date utilities (`clamp_day`, `advance_month`, `get_first_due_date`, `make_date`)
-  - `Lines 50–135`: Dataclasses (`CreditCard`, `Loan`, `MonthlyPayment`, `IncomeSchedule`)
-  - `Lines 137–365`: `DebtOptimizer.__init__` (state setup, renewal normalization, cycle date resolution)
-  - `Lines 367–450`: Income schedules, issuer cycle end logic, credit card minimum payment formulas
-  - `Lines 452–594`: `get_projected_min_margin()`, `calculate_disposable_cash()` (lookahead cushion engine)
-  - `Lines 595–897`: `run()` (daily simulation loop, 6-step order of operations)
-  - `Lines 900–908`: `run_self_tests()` test delegator
-  - `Lines 910–1302`: Google Sheets I/O, parsers, batch Output writer, conditional formatting (`apply_output_formatting`)
-  - `Lines 1304–1355`: CLI argument parsing and entrypoint
+  - `Lines 20–53`: Date utilities (`clamp_day`, `advance_month`, `get_first_due_date`, `make_date`, `parse_date`)
+  - `Lines 55–137`: Dataclasses (`CreditCard`, `Loan`, `MonthlyPayment`, `IncomeSchedule`)
+  - `Lines 139–350`: `DebtOptimizer.__init__` (state setup, renewal normalization, cycle date resolution)
+  - `Lines 351–495`: Income schedules, issuer cycle end logic, credit card minimum payment formulas
+  - `Lines 496–603`: `get_projected_min_margin()`, `calculate_disposable_cash()` (lookahead cushion engine)
+  - `Lines 604–908`: `run()` (daily simulation loop, 6-step order of operations)
+  - `Lines 911–919`: `run_self_tests()` test delegator
+  - `Lines 921–1296`: Google Sheets I/O, parsers, batch Output writer, conditional formatting (`apply_output_formatting`)
+  - `Lines 1298–1348`: CLI argument parsing and entrypoint
 - **`test_debt_optimizer.py`**:
   - `Tests 1–9`: Baseline issuer formulas and cycle closures
   - `Tests 10–32`: Extended edge cases, month clamping, annual fees, debt avalanche priority

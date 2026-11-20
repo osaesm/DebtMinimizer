@@ -618,6 +618,48 @@ def run_self_tests():
     assert opt40.get_total_income(datetime.date(2026, 2, 1)) == 3000.0
     assert opt40.get_total_income(datetime.date(2026, 2, 15)) == 3000.0
     assert opt40.get_total_income(datetime.date(2026, 2, 7)) == 0.0
+
+    # Verify missing/empty Type, Paycheck Amount, or Start Date raise ValueError instead of defaulting to 0
+    try:
+        DebtOptimizer(
+            {'Start Date': datetime.date(2026, 2, 1), 'End Date': datetime.date(2026, 2, 28), 'Initial Checking Balance': 1000, 'Checking Buffer': 0},
+            [], [], [], [{'Type': '', 'Paycheck Amount': 3000}]
+        )
+        assert False, "Expected ValueError for empty income Type"
+    except ValueError as e:
+        assert "Invalid or missing income schedule Type" in str(e)
+
+    try:
+        DebtOptimizer(
+            {'Start Date': datetime.date(2026, 2, 1), 'End Date': datetime.date(2026, 2, 28), 'Initial Checking Balance': 1000, 'Checking Buffer': 0},
+            [], [], [], [{'Type': 'Semi-Monthly'}]
+        )
+        assert False, "Expected ValueError for missing Paycheck Amount"
+    except ValueError as e:
+        assert "missing 'Paycheck Amount'" in str(e)
+
+    try:
+        DebtOptimizer(
+            {'Start Date': datetime.date(2026, 2, 1), 'End Date': datetime.date(2026, 2, 28), 'Initial Checking Balance': 1000, 'Checking Buffer': 0},
+            [], [], [], [{'Type': 'Biweekly', 'Paycheck Amount': 2000}]
+        )
+        assert False, "Expected ValueError for missing Start Date"
+    except ValueError as e:
+        assert "missing 'Start Date'" in str(e)
+
+    # Verify missing CreditCard required fields raise ValueError
+    base_cc = {'Card': 'TestCC', 'Issuer': 'Chase', 'APR': 0.20, 'Balance': 1000, 'Statement Balance': 1000, 'Grace Active': True, 'Due Day': 15, 'Min Floor': 25, 'Statement Cycle End Day': 20}
+    for field in ('Card', 'Issuer', 'APR', 'Balance', 'Statement Balance', 'Grace Active', 'Due Day', 'Min Floor'):
+        bad_cc = dict(base_cc)
+        del bad_cc[field]
+        try:
+            DebtOptimizer(
+                {'Start Date': datetime.date(2026, 2, 1), 'End Date': datetime.date(2026, 2, 28), 'Initial Checking Balance': 1000, 'Checking Buffer': 0},
+                [bad_cc], [], [], [{'Type': 'Semi-Monthly', 'Paycheck Amount': 3000}]
+            )
+            assert False, f"Expected ValueError for missing {field}"
+        except ValueError as e:
+            assert f"missing '{field}'" in str(e)
     print("  -> Passed!")
 
     # Test 41: Multiple Simultaneous Income Sources (Biweekly + Semi-Monthly)
